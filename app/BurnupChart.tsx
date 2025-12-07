@@ -16,7 +16,29 @@ export function BurnupChart({
     targetDateMs,
     sprints,
     projection,
+    hasAnyDone,          // <-- NEW
   } = model;
+
+  /* ---------- no Done stories: show message, no chart ---------- */
+
+  if (!hasAnyDone) {
+    return (
+      <div
+        style={{
+          padding: '12px 16px',
+          fontSize: 12,
+          color: '#374151',
+          borderRadius: 6,
+          border: '1px solid #e5e7eb',
+          background: '#f9fafb',
+        }}
+      >
+        <strong>No burn up to show as no Story Done yet.</strong>{' '}
+        Current scope is ={' '}
+        <span style={{ fontWeight: 600 }}>{latestScope}</span>.
+      </div>
+    );
+  }
 
   /* ---------- basic derived values ---------- */
 
@@ -194,10 +216,6 @@ export function BurnupChart({
   const historicalPath = buildPath(historicalPoints);
 
   // Scope polyline (green)
-  //  - uses real scope for history
-  //  - if adjustedNextScope is provided and we can anchor it, then:
-  //    * draw to next open sprint with that value
-  //    * keep flat at that value for all later sprints
   const scopePoints: { x: number; y: number }[] = [originPoint];
 
   const canApplyAdjustedScope =
@@ -216,13 +234,10 @@ export function BurnupChart({
 
     if (canApplyAdjustedScope && nextOpenAfterLastClosed) {
       if (s.index === nextOpenAfterLastClosed.index) {
-        // immediate next open sprint → use adjusted value
         scopeValue = adjustedNextScope as number;
       } else if (s.index > nextOpenAfterLastClosed.index) {
-        // all further sprints → flat line at adjusted value
         scopeValue = adjustedNextScope as number;
       }
-      // indices <= lastClosed.index keep their real scopeAtEnd
     }
 
     const x = xForIndex(s.index);
@@ -230,7 +245,6 @@ export function BurnupChart({
 
     scopePoints.push({ x, y });
 
-    // capture first open / next sprint for label (number only)
     if (
       firstOpenScopeLabelX == null &&
       !s.isClosed &&
@@ -336,7 +350,6 @@ export function BurnupChart({
   const maxTickIndex = Math.floor(baseMaxIndex);
 
   if (sprints && sprints.length > 0) {
-    // Use sprint END dates for tick labels (Excel-style).
     for (const s of sprints) {
       if (s.index > maxTickIndex) break;
       const d = new Date(s.endMs);
@@ -345,7 +358,6 @@ export function BurnupChart({
       xTicks.push({ x: xForIndex(s.index), label: `${dd}/${mm}` });
     }
   } else if (typeof originMs === 'number') {
-    // Fallback: origin-based ticks if we somehow have no sprints
     const tickCount = Math.floor(baseMaxIndex) + 1;
     for (let i = 0; i <= tickCount; i++) {
       const d = new Date(originMs + i * msPerSprint);
@@ -429,7 +441,7 @@ export function BurnupChart({
         );
       })}
 
-      {/* Scope line (stories) – straight polyline, with optional adjusted next sprint */}
+      {/* Scope line (stories) */}
       {scopePath && (
         <path d={scopePath} fill="none" stroke="#16a34a" strokeWidth={2} />
       )}
@@ -527,7 +539,6 @@ export function BurnupChart({
       {/* Pulsating marker on last closed sprint (cone anchor) */}
       {anchorPoint && (
         <g>
-          {/* numeric label for pulsating dot */}
           {anchorDoneValue != null && (
             <text
               x={anchorPoint.x}
@@ -541,7 +552,6 @@ export function BurnupChart({
             </text>
           )}
 
-          {/* solid centre dot */}
           <circle
             cx={anchorPoint.x}
             cy={anchorPoint.y}
@@ -550,7 +560,6 @@ export function BurnupChart({
             stroke="#ffffff"
             strokeWidth={1}
           />
-          {/* pulsing ring */}
           <circle
             cx={anchorPoint.x}
             cy={anchorPoint.y}

@@ -214,7 +214,7 @@ function computeScopeSliderConfig(model: BurnupModel | null): ScopeSliderConfig 
 }
 
 function buildScopeAdjustedModel(
- base: BurnupModel,
+  base: BurnupModel,
   overrideScope: number
 ): BurnupModel {
   const sprints = base.sprints;
@@ -653,6 +653,16 @@ export default function Dashboard() {
       return;
     }
 
+    // NEW: if there is scope but no Done stories yet, do not create a burn-up
+    if (storyTotalCt > 0 && storyDoneCt === 0) {
+      setBurnupError(
+        `No burn up to show as no Story Done yet. Current scope is = ${storyTotalCt}.`
+      );
+      setBurnupModel(null);
+      setBurnupLock(null);
+      return;
+    }
+
     setBurnupError(null);
 
     const stories = issues.map((it) => ({
@@ -770,12 +780,18 @@ export default function Dashboard() {
     transition: 'left 150ms ease',
   };
 
-  const burnupDisabledForProject =
+  const burnupAlreadyCreated =
     !!burnupLock &&
     burnupLock.project === project &&
     burnupLock.scope === scope;
 
-  const sprintDatesLocked = burnupDisabledForProject;
+  // true only for the “no Story Done yet” scenario
+  const noBurnupAvailable =
+    burnupError?.startsWith('No burn up to show as no Story Done yet') ?? false;
+
+  const burnupDisabledForProject = burnupAlreadyCreated;
+
+  const sprintDatesLocked = burnupDisabledForProject || noBurnupAvailable;
 
   const scopeSliderValue =
     scopeOverride ??
@@ -792,6 +808,14 @@ export default function Dashboard() {
     backgroundColor: '#F9FAFB',
     border: '1px solid #E5E7EB',
   };
+
+  const burnupButtonDisabled = burnupAlreadyCreated || noBurnupAvailable;
+
+  const burnupButtonLabel = noBurnupAvailable
+    ? 'Burn-up unavailable'
+    : burnupAlreadyCreated
+    ? 'Burn-up created'
+    : 'Create Burnup';
 
   return (
     <main
@@ -1015,7 +1039,13 @@ export default function Dashboard() {
                       type="date"
                       value={sprintStartISO}
                       onChange={(e) => setSprintStartISO(e.target.value)}
-                      style={{ ...inp(), width: '90%' }}
+                      style={{
+                        ...inp(),
+                        width: '90%',
+                        backgroundColor: sprintDatesLocked
+                          ? '#e5e7eb'
+                          : 'white',
+                      }}
                       title="Start date of the sprint"
                       disabled={sprintDatesLocked}
                     />
@@ -1026,7 +1056,13 @@ export default function Dashboard() {
                       value={sprintEndISO}
                       onChange={(e) => setSprintEndISO(e.target.value)}
                       min={minSprintEnd}
-                      style={{ ...inp(), width: '90%' }}
+                      style={{
+                        ...inp(),
+                        width: '90%',
+                        backgroundColor: sprintDatesLocked
+                          ? '#e5e7eb'
+                          : 'white',
+                      }}
                       title="Defaults to +2 weeks; must be at least 1 day after start"
                       disabled={sprintDatesLocked}
                     />
@@ -1047,8 +1083,12 @@ export default function Dashboard() {
                         step={0.1}
                         value={sprintFTE}
                         onChange={(e) => onChangeFTE(Number(e.target.value))}
-                        style={{ flex: 1 }}
+                        style={{
+                          flex: 1,
+                          opacity: noBurnupAvailable ? 0.4 : 1,
+                        }}
                         title="Average stories completed per sprint from this point"
+                        disabled={noBurnupAvailable}
                       />
                       <span
                         style={{
@@ -1056,7 +1096,7 @@ export default function Dashboard() {
                           marginRight: 8,
                           textAlign: 'right',
                           fontVariantNumeric: 'tabular-nums',
-                          color: '#111827',
+                          color: noBurnupAvailable ? '#9ca3af' : '#111827',
                         }}
                       >
                         {sprintFTE.toFixed(1)}
@@ -1107,13 +1147,19 @@ export default function Dashboard() {
                       <button
                         type="button"
                         onClick={onClickCreateBurnup}
-                        style={btn()}
+                        style={{
+                          ...btn(),
+                          backgroundColor: burnupButtonDisabled
+                            ? '#9ca3af'
+                            : '#2563EB',
+                          cursor: burnupButtonDisabled
+                            ? 'not-allowed'
+                            : 'pointer',
+                        }}
                         title="Generate the burn-up projection using these parameters"
-                        disabled={burnupDisabledForProject}
+                        disabled={burnupButtonDisabled}
                       >
-                        {burnupDisabledForProject
-                          ? 'Burn-up created'
-                          : 'Create Burnup'}
+                        {burnupButtonLabel}
                       </button>
                     </div>
                   </div>
@@ -1130,7 +1176,17 @@ export default function Dashboard() {
                   >
                     Velocity snapshot
                   </div>
-                  {burnupModel && velocityInsights ? (
+                  {noBurnupAvailable ? (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: '#9ca3af',
+                      }}
+                    >
+                      No burn up to show as no Story Done yet. Current scope is ={' '}
+                      {storyTotalCt}.
+                    </div>
+                  ) : burnupModel && velocityInsights ? (
                     <div
                       style={{
                         fontSize: 12,

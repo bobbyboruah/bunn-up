@@ -70,6 +70,10 @@ export type BurnupModel = {
   sprints: SprintSummary[];
   projection: BurnupProjection;
 
+  // Aggregate Done info (for UI decisions like "no burn-up yet")
+  totalDoneStories: number;
+  hasAnyDone: boolean;
+
   // Simple health vs target
   isOnTrack: boolean | null; // null if we can't compute projection
   daysDeltaFromTarget: number | null; // +ve = finishes after target; -ve = before
@@ -242,6 +246,11 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     sprints.length > 0 ? sprints[sprints.length - 1]!.scopeAtEnd : 0;
   const targetScope = computeScopeAtDate(sprints, targetDateMs);
 
+  // NEW: total Done stories & flag for “any Done at all?”
+  const totalDoneStories =
+    sprints.length > 0 ? sprints[sprints.length - 1]!.cumDoneEnd : 0;
+  const hasAnyDone = totalDoneStories > 0;
+
   // Build projection based on last 2 closed sprints
   const projection = computeProjection(
     sprints,
@@ -273,6 +282,8 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     todayMs,
     sprints,
     projection,
+    totalDoneStories,
+    hasAnyDone,
     isOnTrack,
     daysDeltaFromTarget: daysDelta,
   };
@@ -520,6 +531,8 @@ function emptyModel(
       requiredStoriesPerSprintToHitTarget: null,
       recentStoriesPerSprint: null,
     },
+    totalDoneStories: 0,
+    hasAnyDone: false,
     isOnTrack: null,
     daysDeltaFromTarget: null,
   };
