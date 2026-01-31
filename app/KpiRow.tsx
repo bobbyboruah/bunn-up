@@ -35,13 +35,77 @@ function colorFor(label: string): string {
   return palette[h % palette.length]!;
 }
 
-const STATUS_COLOR: Record<string, string> = {
-  Open: '#84CC16',
+/**
+ * Explicit + normalized status colors to avoid misleading duplicates.
+ * Goal: "Open" and "Done" should never share the same color.
+ */
+const STATUS_COLOR_EXACT: Record<string, string> = {
+  // Make Open clearly distinct from Done
+  Open: '#6B7280', // grey
+  Done: '#10B981', // green
+  DONE: '#10B981', // green (common in some Jira workflows)
+  Closed: '#10B981', // green
+
+  // Common buckets / workflow signals
+  'To Do': '#6B7280',
+  'In Progress': '#2563EB',
+  'In Dev': '#8B5CF6',
+
+  Blocked: '#F59E0B',
+  Onhold: '#F59E0B',
+  'On Hold': '#F59E0B',
+  'On Hold (By Dev)': '#F59E0B',
+  'On Hold (By QA)': '#F59E0B',
+
+  // Your previous special cases
   'Define Complete': '#0EA5E9',
   'Allocated to QA (I)': '#2563EB',
   'Analysis Complete': '#F59E0B',
 };
-const getColor = (label: string) => STATUS_COLOR[label] ?? colorFor(label);
+
+function normalizeStatus(s: string): string {
+  return (s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Normalized + keyword fallback so "Done-ish" statuses stay green even if named differently.
+ */
+function getColor(label: string): string {
+  const exact = STATUS_COLOR_EXACT[label];
+  if (exact) return exact;
+
+  const n = normalizeStatus(label);
+
+  // Hard normalized matches (case/spacing differences)
+  if (n === 'open') return '#6B7280';
+  if (n === 'done' || n === 'closed') return '#10B981';
+  if (n === 'to do') return '#6B7280';
+  if (n === 'in progress') return '#2563EB';
+  if (n === 'in dev') return '#8B5CF6';
+
+  // Keyword heuristics (covers "Done (UAT)", "Dev Done", etc.)
+  if (/\bdone\b/.test(n) || /\bclosed\b/.test(n) || n.includes('complete')) {
+    // If it's "complete" but clearly QA/dev complete, keep it distinct (cyan) else green.
+    if (n.includes('qa') || n.includes('test')) return '#06B6D4';
+    if (n.includes('define')) return '#0EA5E9';
+    return '#10B981';
+  }
+
+  if (n.includes('blocked') || n.includes('on hold') || n.includes('hold')) {
+    return '#F59E0B';
+  }
+
+  if (n.includes('qa') || n.includes('test') || n.includes('uat')) {
+    return '#06B6D4';
+  }
+
+  if (n.includes('dev') || n.includes('build')) {
+    return '#8B5CF6';
+  }
+
+  // Fallback: stable hash palette
+  return colorFor(label);
+}
 
 /* ------------------ Jira link helper ------------------ */
 
@@ -314,27 +378,24 @@ export function KpiRow(props: KpiRowProps) {
 
   /* ---------- Project Health ---------- */
 
-  const healthOpts = useMemo(
-    () => {
-      const o: {
-        scope: Scope;
-        pmApprovedFn: (r: IssueRow) => boolean;
-        devPctOverride?: number;
-        devCounts?: { done: number; total: number };
-      } = {
-        scope,
-        pmApprovedFn: isPmApprovedFn,
-      };
+  const healthOpts = useMemo(() => {
+    const o: {
+      scope: Scope;
+      pmApprovedFn: (r: IssueRow) => boolean;
+      devPctOverride?: number;
+      devCounts?: { done: number; total: number };
+    } = {
+      scope,
+      pmApprovedFn: isPmApprovedFn,
+    };
 
-      if (storyTotalCt > 0) {
-        o.devPctOverride = storyDoneCt / Math.max(1, storyTotalCt);
-        o.devCounts = { done: storyDoneCt, total: storyTotalCt };
-      }
+    if (storyTotalCt > 0) {
+      o.devPctOverride = storyDoneCt / Math.max(1, storyTotalCt);
+      o.devCounts = { done: storyDoneCt, total: storyTotalCt };
+    }
 
-      return o;
-    },
-    [scope, isPmApprovedFn, storyDoneCt, storyTotalCt]
-  );
+    return o;
+  }, [scope, isPmApprovedFn, storyDoneCt, storyTotalCt]);
 
   const healthRaw = useMemo(
     () => computeHealth(issues, devStartISO, devCompletionISO, healthOpts),
@@ -342,35 +403,32 @@ export function KpiRow(props: KpiRowProps) {
   );
 
   // Fix Requirement Completion: use PM Approved + Yet to Approve where possible.
-  const health = useMemo(
-    () => {
-      let pmA = pmApprovedCt;
-      let totalReq = pmApprovedCt + notPmApprovedCt;
+  const health = useMemo(() => {
+    let pmA = pmApprovedCt;
+    let totalReq = pmApprovedCt + notPmApprovedCt;
 
-      if (!Number.isFinite(totalReq) || totalReq <= 0) {
-        // Fallback to issues if counts are missing
-        pmA = issues.filter(isPmApprovedFn).length;
-        totalReq = issues.length;
-      }
+    if (!Number.isFinite(totalReq) || totalReq <= 0) {
+      // Fallback to issues if counts are missing
+      pmA = issues.filter(isPmApprovedFn).length;
+      totalReq = issues.length;
+    }
 
-      totalReq = Math.max(1, totalReq);
-      const defPct = (pmA / totalReq) * 100;
+    totalReq = Math.max(1, totalReq);
+    const defPct = (pmA / totalReq) * 100;
 
-      return {
-        ...healthRaw,
-        progress: {
-          ...healthRaw.progress,
-          pmApproved: pmA,
-          total: totalReq,
-          defPct,
-          devPct: healthRaw.progress.devPct,
-          devDone: healthRaw.progress.devDone,
-          devTotal: healthRaw.progress.devTotal,
-        },
-      };
-    },
-    [healthRaw, pmApprovedCt, notPmApprovedCt, issues, isPmApprovedFn]
-  );
+    return {
+      ...healthRaw,
+      progress: {
+        ...healthRaw.progress,
+        pmApproved: pmA,
+        total: totalReq,
+        defPct,
+        devPct: healthRaw.progress.devPct,
+        devDone: healthRaw.progress.devDone,
+        devTotal: healthRaw.progress.devTotal,
+      },
+    };
+  }, [healthRaw, pmApprovedCt, notPmApprovedCt, issues, isPmApprovedFn]);
 
   return (
     <section
@@ -389,11 +447,7 @@ export function KpiRow(props: KpiRowProps) {
             <tbody>
               <SummaryRow
                 label={
-                  <a
-                    href={jiraUrl(jqlPMApproved)}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
+                  <a href={jiraUrl(jqlPMApproved)} target="_blank" rel="noreferrer">
                     PM Approved
                   </a>
                 }
@@ -402,11 +456,7 @@ export function KpiRow(props: KpiRowProps) {
               />
               <SummaryRow
                 label={
-                  <a
-                    href={jiraUrl(jqlNotPMApproved)}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
+                  <a href={jiraUrl(jqlNotPMApproved)} target="_blank" rel="noreferrer">
                     Yet to Approve
                   </a>
                 }
@@ -471,12 +521,7 @@ export function KpiRow(props: KpiRowProps) {
                 color="#10B981"
               />
               <tr>
-                <td
-                  style={{
-                    ...td(true),
-                    borderTop: '1px solid #e5e7eb',
-                  }}
-                >
+                <td style={{ ...td(true), borderTop: '1px solid #e5e7eb' }}>
                   Total
                 </td>
                 <td
@@ -764,13 +809,7 @@ function FullPie({
   );
 }
 
-function arcPath(
-  cx: number,
-  cy: number,
-  r: number,
-  start: number,
-  end: number
-) {
+function arcPath(cx: number, cy: number, r: number, start: number, end: number) {
   let e = end;
   if (e - start <= 1e-6) e = start + 1e-6;
   const sx = cx + r * Math.cos(start);
@@ -944,9 +983,7 @@ function HealthPanel({ health }: { health: any }) {
 
   const paceScore = Number.isFinite(sched.score) ? (sched.score as number) : 0;
   const overallScoreRaw = 0.4 * paceScore + 0.3 * wipScore + 0.3 * agingScore;
-  const overallScore = Math.round(
-    Math.max(0, Math.min(100, overallScoreRaw))
-  );
+  const overallScore = Math.round(Math.max(0, Math.min(100, overallScoreRaw)));
 
   let overallBadge: 'Green' | 'Amber' | 'Red';
   let overallSummary: string;
@@ -1020,15 +1057,11 @@ function HealthPanel({ health }: { health: any }) {
           }}
         >
           <div>
-            Requirement Completion:{' '}
-            <b>{round1(health.progress.defPct)}%</b>
+            Requirement Completion: <b>{round1(health.progress.defPct)}%</b>
           </div>
           <div>
             Development Completion:{' '}
-            <b>
-              {round1(health.progress.devPct ?? health.progress.wfPct)}
-              %
-            </b>
+            <b>{round1(health.progress.devPct ?? health.progress.wfPct)}%</b>
           </div>
         </div>
       </div>
@@ -1064,13 +1097,7 @@ function HealthPanel({ health }: { health: any }) {
                   marginBottom: 2,
                 }}
               >
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6,
-                  }}
-                >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span
                     aria-hidden
                     style={{
@@ -1090,13 +1117,7 @@ function HealthPanel({ health }: { health: any }) {
                     {card.title}
                   </span>
                 </div>
-                <span
-                  style={{
-                    fontSize: 11,
-                    fontWeight: 600,
-                    color,
-                  }}
-                >
+                <span style={{ fontSize: 11, fontWeight: 600, color }}>
                   {card.tone === 'good'
                     ? 'Good'
                     : card.tone === 'warn'
@@ -1105,32 +1126,14 @@ function HealthPanel({ health }: { health: any }) {
                 </span>
               </div>
 
-              <div
-                style={{
-                  fontSize: 11,
-                  color: '#111827',
-                }}
-              >
-                {card.metric}
-              </div>
+              <div style={{ fontSize: 11, color: '#111827' }}>{card.metric}</div>
 
-              <div
-                style={{
-                  fontSize: 11,
-                  color: '#B91C1C',
-                  marginTop: 4,
-                }}
-              >
+              <div style={{ fontSize: 11, color: '#B91C1C', marginTop: 4 }}>
                 <strong>Issue: </strong>
                 {card.issue}
               </div>
 
-              <div
-                style={{
-                  fontSize: 11,
-                  color: '#374151',
-                }}
-              >
+              <div style={{ fontSize: 11, color: '#374151' }}>
                 <strong>Remediation (next week): </strong>
                 {card.remediation}
               </div>

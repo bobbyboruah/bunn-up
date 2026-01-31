@@ -16,8 +16,8 @@ export interface BurnupIssue {
 
 export type SprintSummary = {
   index: number;
-  startMs: number; // UTC midnight
-  endMs: number; // UTC midnight
+  startMs: number; // UTC midnight (epoch-day)
+  endMs: number; // UTC midnight (epoch-day)
   scopeAtEnd: number; // total scope (stories) existing by end of sprint
   scopeAtStart: number; // scope at sprint start
   doneThisSprint: number; // stories done in this sprint
@@ -31,7 +31,7 @@ export type BurnupProjection = {
   fromTimeMs: number | null;
   fromDone: number | null; // cum done at fromTime
   projectedDonePerSprint: number | null; // stories per sprint at current FTE
-  avgVelPerFTE: number | null; // stories per FTE per sprint (last 2 sprints)
+  avgVelPerFTE: number | null; // stories per FTE per sprint (recent non-zero)
   projectedCompletionMs: number | null; // central projection
   projectedCompletionEarlyMs: number | null; // +20% velocity
   projectedCompletionLateMs: number | null; // -20% velocity
@@ -54,8 +54,8 @@ export type BurnupProjection = {
   // by the target date.
   requiredStoriesPerSprintToHitTarget: number | null;
 
-  // Recent actual burn rate: avg stories done per sprint over the last
-  // 1–2 closed sprints (raw stories, not normalised by FTE).
+  // Recent actual burn rate: avg stories done per sprint over the most recent
+  // 1–2 non-zero closed sprints.
   recentStoriesPerSprint: number | null;
 };
 
@@ -95,13 +95,17 @@ export type BuildBurnupInput = {
 /**
  * Main entry point: turn raw stories + sprint parameters into a burn-up model.
  *
- * Sprint logic (to match Excel):
- * - Find earliest valid Done story:
- *     firstSprintEnd   = earliest Done resolutiondate
- *     firstSprintStart = firstSprintEnd - sprintLengthDays
- * - Later sprints are just +sprintLengthDays from the previous end.
- * - If there are NO Done stories yet, we fall back to:
+ * Sprint logic (workaround for Jira sprint hygiene):
+ * - If there are Done stories:
+ *     firstSprintEnd   = earliest Done resolutiondate (date-only)
+ *     firstSprintStart = firstSprintEnd - N working days (Mon–Fri),
+ *                        where N ~= sprintLengthDays * 5/7 (14 -> 10)
+ * - If there are NO Done stories yet:
  *     origin = min(UI sprintStartISO, earliest created) or today.
+ *
+ * IMPORTANT FIXES:
+ * 1) All "midnight" values are computed using epoch-day flooring (UTC date-only).
+ * 2) Projection signal uses recent NON-ZERO closed sprints.
  */
 export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
   const sprintLenDays = input.sprintLengthDays ?? 14;
@@ -109,9 +113,10 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
 
   const uiOriginMs = parseISODate(input.sprintStartISO);
   const targetDateMs = parseISODate(input.devCompletionISO);
+
   const todayMs = input.todayISO
     ? parseISODate(input.todayISO)
-    : floorToUtcMidnight(new Date());
+    : epochDayFloorMs(Date.now());
 
   if (!Number.isFinite(targetDateMs)) {
     // Invalid target – return empty-ish model but don't throw.
@@ -123,7 +128,7 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     Number.isFinite(input.sprintFTE) ? input.sprintFTE : 0
   );
 
-  // Normalise stories to day-level timestamps (UTC midnight)
+  // Normalise stories to day-level timestamps (epoch-day / UTC midnight)
   const stories = (input.stories ?? [])
     .map(normaliseIssue)
     .filter(Boolean) as NormalisedIssue[];
@@ -142,27 +147,30 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     const allCreated = stories.map((s) => s.createdMs);
 
     if (validDone.length > 0) {
-      // Excel-style: earliest valid Done story → first sprint END.
+      // Variant 1:
+      // earliest valid Done story → first sprint END (date-only),
+      // then subtract working days to derive first sprint START.
       const earliestDoneMs = Math.min(
         ...validDone.map((s) => s.resolvedMs as number)
       );
-      const firstSprintStartMs = earliestDoneMs - sprintLenMs; // first sprint start
-      originMs = firstSprintStartMs;
+
+      // 14 calendar days => ~10 working days (Mon–Fri)
+      const workingDaysBack = Math.max(1, Math.round((sprintLenDays * 5) / 7));
+
+      originMs = subtractWorkingDaysUTC(earliestDoneMs, workingDaysBack);
     } else {
-      // No Done yet: anchor on earliest created (or UI if earlier), so you
-      // still get "future-looking" burn-up while nothing is closed yet.
+      // No Done yet: anchor on earliest created (or UI if earlier)
       const earliestCreatedMs = Math.min(...allCreated);
-      if (Number.isFinite(uiOriginMs)) {
-        originMs = Math.min(uiOriginMs, earliestCreatedMs);
-      } else {
-        originMs = earliestCreatedMs;
-      }
+      originMs = Number.isFinite(uiOriginMs)
+        ? Math.min(uiOriginMs, earliestCreatedMs)
+        : earliestCreatedMs;
     }
   }
 
-  if (!Number.isFinite(originMs)) {
-    originMs = todayMs;
-  }
+  if (!Number.isFinite(originMs)) originMs = todayMs;
+
+  // Ensure origin is epoch-day aligned (timezone-proof)
+  originMs = epochDayFloorMs(originMs);
 
   // If there are no stories, still build some empty sprints along the time axis.
   const lastStoryCreatedMs =
@@ -189,7 +197,6 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
   const sprints: SprintSummary[] = [];
 
   let i = 0;
-  // keep previous scope & cumulative done to derive per-sprint increments
   let prevScopeAtEnd = 0;
   let prevCumDone = 0;
 
@@ -207,9 +214,8 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
 
     const scopeAtStart = i === 0 ? 0 : prevScopeAtEnd;
 
-    // Cumulative "done" by end of this sprint (raw, before clamping)
-    // IMPORTANT: only count stories that *exist* by endMs (created < endMs),
-    // to avoid any possibility of done > scope for this bucket.
+    // Cumulative "done" by end of this sprint (raw)
+    // Only count stories that exist by endMs (created < endMs)
     const doneByEndRaw = stories.filter(
       (s) =>
         s.isDone &&
@@ -222,7 +228,7 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     // Clamp cumulative done so we never show more completed than exist.
     const cumDoneEnd = Math.min(doneByEndRaw, scopeAtEnd);
 
-    // Incremental done in this sprint (for velocity / projection)
+    // Incremental done in this sprint
     const doneThisSprint =
       i === 0 ? cumDoneEnd : Math.max(0, cumDoneEnd - prevCumDone);
 
@@ -246,12 +252,10 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     sprints.length > 0 ? sprints[sprints.length - 1]!.scopeAtEnd : 0;
   const targetScope = computeScopeAtDate(sprints, targetDateMs);
 
-  // NEW: total Done stories & flag for “any Done at all?”
   const totalDoneStories =
     sprints.length > 0 ? sprints[sprints.length - 1]!.cumDoneEnd : 0;
   const hasAnyDone = totalDoneStories > 0;
 
-  // Build projection based on last 2 closed sprints
   const projection = computeProjection(
     sprints,
     sprintLenMs,
@@ -293,18 +297,12 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
  * Recompute the projection (cone + dates) for a new FTE value, keeping:
  * - the last closed sprint as the anchor (red pulsating dot)
  * - the historical avg stories-per-FTE (avgVelPerFTE) fixed.
- *
- * Used by the Engineers(FTE) slider so we don't touch historical data,
- * only the future slope from "today" onward.
  */
 export function recomputeProjectionWithFTE(
   model: BurnupModel,
   sprintFTE: number
 ): BurnupModel {
-  const safeFte = Math.max(
-    0,
-    Number.isFinite(sprintFTE) ? sprintFTE : 0
-  );
+  const safeFte = Math.max(0, Number.isFinite(sprintFTE) ? sprintFTE : 0);
 
   const { sprints, latestScope, sprintLengthDays, targetDateMs, projection } =
     model;
@@ -319,7 +317,6 @@ export function recomputeProjectionWithFTE(
     projection.avgVelPerFTE == null ||
     projection.avgVelPerFTE <= 0
   ) {
-    // Nothing meaningful to re-project, just return original model.
     return model;
   }
 
@@ -329,7 +326,7 @@ export function recomputeProjectionWithFTE(
   const fromDone = projection.fromDone;
   const avgVelPerFTE = projection.avgVelPerFTE;
 
-  const fte = Math.max(0.1, safeFte || 0); // avoid divide-by-zero
+  const fte = Math.max(0.1, safeFte || 0);
   const projectedDonePerSprint = avgVelPerFTE * fte;
 
   if (projectedDonePerSprint <= 0) {
@@ -385,7 +382,6 @@ export function recomputeProjectionWithFTE(
     projectedCompletionLateMs,
   };
 
-  // Recompute simple health vs target for the new slope
   let isOnTrack: boolean | null = null;
   let daysDeltaFromTarget: number | null = null;
 
@@ -420,14 +416,33 @@ type NormalisedIssue = {
 };
 
 /**
+ * Timezone-proof "UTC midnight" flooring by epoch-day.
+ * Works regardless of runtime timezone / DST.
+ */
+function epochDayFloorMs(ms: number): number {
+  if (!Number.isFinite(ms)) return NaN;
+  return Math.floor(ms / DAY_MS) * DAY_MS;
+}
+
+/**
+ * Subtract N working days (Mon–Fri) from a UTC date-only timestamp.
+ * Input and output are UTC midnight (epoch-day).
+ */
+function subtractWorkingDaysUTC(endMs: number, workingDays: number): number {
+  let ms = epochDayFloorMs(endMs);
+  let left = Math.max(0, Math.floor(workingDays));
+
+  // Count backwards excluding weekends.
+  while (left > 0) {
+    ms -= DAY_MS;
+    const dow = new Date(ms).getUTCDay(); // 0=Sun ... 6=Sat
+    if (dow !== 0 && dow !== 6) left -= 1;
+  }
+  return ms;
+}
+
+/**
  * Normalise a Jira issue into timestamps + Done/cancelled flags.
- *
- * Behaviour:
- * - createdMs  = created date (UTC midnight)
- * - resolvedMs = resolutiondate (UTC midnight) if present & valid,
- *                otherwise falls back to createdMs if status/category is Done
- * - isCancelled = status contains WITHDRAWN or CANCELLED
- * - isDone = resolvedMs exists, not cancelled, and status/category looks Done
  */
 function normaliseIssue(issue: BurnupIssue): NormalisedIssue | null {
   if (!issue || !issue.created) return null;
@@ -438,26 +453,19 @@ function normaliseIssue(issue: BurnupIssue): NormalisedIssue | null {
   const rawStatus = (issue.status ?? '').trim().toUpperCase();
   const categoryDone = issue.statusCategory === 'Done';
 
-  // Cancelled / withdrawn detection
   const isCancelled =
     rawStatus.includes('WITHDRAWN') || rawStatus.includes('CANCELLED');
 
-  // Try to parse resolutiondate if present
   let resolvedMs: number | null = null;
   if (issue.resolutiondate) {
     const parsed = parseJiraDate(issue.resolutiondate);
-    if (Number.isFinite(parsed)) {
-      resolvedMs = parsed;
-    }
+    if (Number.isFinite(parsed)) resolvedMs = parsed;
   }
 
-  // If Jira hasn’t given us a resolutiondate but the issue is clearly Done,
-  // fall back to created date so it at least appears in a sprint bucket.
   if (!resolvedMs && (categoryDone || rawStatus === 'DONE')) {
     resolvedMs = createdMs;
   }
 
-  // Final Done flag: resolved + not cancelled + looks like Done in status/category
   const isDone =
     !!resolvedMs &&
     !isCancelled &&
@@ -472,13 +480,13 @@ function normaliseIssue(issue: BurnupIssue): NormalisedIssue | null {
 }
 
 /**
- * Parse "YYYY-MM-DD" into UTC midnight timestamp.
+ * Parse "YYYY-MM-DD" into UTC midnight timestamp (epoch-day).
  */
 function parseISODate(iso: string): number {
   if (!iso) return NaN;
   const [yStr, mStr, dStr] = iso.split('-');
   const y = Number(yStr);
-  const m = Number(mStr) - 1; // 0-based
+  const m = Number(mStr) - 1;
   const d = Number(dStr);
   if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) {
     return NaN;
@@ -487,17 +495,13 @@ function parseISODate(iso: string): number {
 }
 
 /**
- * Parse arbitrary Jira date string into UTC midnight timestamp.
+ * Parse arbitrary Jira date string into UTC midnight (epoch-day).
  */
 function parseJiraDate(value: string): number {
   if (!value) return NaN;
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return NaN;
-  return floorToUtcMidnight(d);
-}
-
-function floorToUtcMidnight(d: Date): number {
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return NaN;
+  return epochDayFloorMs(ms);
 }
 
 function emptyModel(
@@ -542,12 +546,8 @@ function emptyModel(
  * Find the scope (stories existing) at a particular date by using the sprint
  * whose end date is >= that date.
  */
-function computeScopeAtDate(
-  sprints: SprintSummary[],
-  dateMs: number
-): number {
+function computeScopeAtDate(sprints: SprintSummary[], dateMs: number): number {
   if (!sprints.length) return 0;
-  // Find sprint whose end >= date
   let chosen: SprintSummary | null = null;
   for (const s of sprints) {
     if (dateMs <= s.endMs) {
@@ -555,12 +555,18 @@ function computeScopeAtDate(
       break;
     }
   }
-  if (!chosen) {
-    chosen = sprints[sprints.length - 1]!;
-  }
+  if (!chosen) chosen = sprints[sprints.length - 1]!;
   return chosen.scopeAtEnd;
 }
 
+/**
+ * Projection FIX:
+ * - Anchor at last closed sprint (still true).
+ * - Velocity: look back across several closed sprints and use the most recent
+ *   1–2 NON-ZERO doneThisSprint values to derive avgVelPerFTE.
+ *
+ * This prevents hasSignal=false just because the last two sprints had 0 done.
+ */
 function computeProjection(
   sprints: SprintSummary[],
   sprintLenMs: number,
@@ -599,7 +605,6 @@ function computeProjection(
   }
 
   if (lastClosedIndex == null || lastClosedIndex < 0) {
-    // No closed sprints yet – nothing meaningful to project
     return {
       hasSignal: false,
       fromSprintIndex: null,
@@ -619,16 +624,10 @@ function computeProjection(
     };
   }
 
-  const l1 = lastClosedIndex;
-  const l0 = l1 > 0 ? l1 - 1 : null;
+  const fromTimeMs = sprints[lastClosedIndex]!.endMs;
+  const fromDone = sprints[lastClosedIndex]!.cumDoneEnd;
 
-  const fromTimeMs = sprints[l1]!.endMs;
-  const fromDone = sprints[l1]!.cumDoneEnd;
-
-  // Stories remaining to the *latest* scope line
   const remainingStoriesFromAnchor = Math.max(0, latestScope - fromDone);
-
-  // Stories remaining to the scope at the target date
   const remainingToTarget = Math.max(0, targetScope - fromDone);
 
   // Sprints remaining (ceil) and required stories/sprint to hit target
@@ -645,38 +644,36 @@ function computeProjection(
     }
   }
 
-  // Recent actual burn rate (stories per sprint over last 1–2 sprints)
-  const doneCounts: number[] = [];
-  doneCounts.push(sprints[l1]!.doneThisSprint);
-  if (l0 != null) {
-    doneCounts.push(sprints[l0]!.doneThisSprint);
-  }
-  const doneFiltered = doneCounts.filter((n) => n > 0);
-  const recentStoriesPerSprint =
-    doneFiltered.length > 0
-      ? doneFiltered.reduce((sum, n) => sum + n, 0) / doneFiltered.length
-      : null;
+  const fte = Math.max(0.1, Number.isFinite(sprintFTE) ? sprintFTE : 0);
 
-  // FTE-normalised velocities for the cone + projected completion
-  const velocities: number[] = [];
-  const fte = Math.max(0.1, sprintFTE || 0); // avoid divide by zero
+  // Look back across several closed sprints to find non-zero done sprints
+  const LOOKBACK_CLOSED = 8;
 
-  if (fte > 0) {
-    const v1 = sprints[l1]!.doneThisSprint / fte;
-    velocities.push(v1);
+  const nonZeroDoneThis: number[] = [];
+  const nonZeroVelPerFTE: number[] = [];
 
-    if (l0 != null) {
-      const v0 = sprints[l0]!.doneThisSprint / fte;
-      velocities.push(v0);
+  let takenClosed = 0;
+  for (let i = lastClosedIndex; i >= 0 && takenClosed < LOOKBACK_CLOSED; i--) {
+    if (!sprints[i]!.isClosed) continue;
+    takenClosed += 1;
+
+    const doneThis = sprints[i]!.doneThisSprint;
+    if (doneThis > 0) {
+      nonZeroDoneThis.push(doneThis);
+      nonZeroVelPerFTE.push(doneThis / fte);
+      if (nonZeroVelPerFTE.length >= 2) break; // most recent 2 non-zero
     }
   }
 
-  // discard zero velocities
-  const filtered = velocities.filter((v) => v > 0);
-  if (!filtered.length) {
+  const recentStoriesPerSprint =
+    nonZeroDoneThis.length > 0
+      ? nonZeroDoneThis.reduce((sum, n) => sum + n, 0) / nonZeroDoneThis.length
+      : null;
+
+  if (!nonZeroVelPerFTE.length) {
     return {
       hasSignal: false,
-      fromSprintIndex: l1,
+      fromSprintIndex: lastClosedIndex,
       fromTimeMs,
       fromDone,
       projectedDonePerSprint: null,
@@ -694,7 +691,7 @@ function computeProjection(
   }
 
   const avgVelPerFTE =
-    filtered.reduce((sum, v) => sum + v, 0) / filtered.length;
+    nonZeroVelPerFTE.reduce((sum, v) => sum + v, 0) / nonZeroVelPerFTE.length;
 
   // ---------- FTE needed to hit target date/scope from this anchor ----------
   let requiredFTEToHitTarget: number | null = null;
@@ -702,10 +699,9 @@ function computeProjection(
 
   if (avgVelPerFTE > 0 && Number.isFinite(targetDateMs)) {
     if (remainingToTarget <= 0) {
-      // Already at or beyond target scope by the anchor point.
       requiredFTEToHitTarget = 0;
       suggestedMaxFTE = Math.max(sprintFTE, 0) + 1;
-    } else if (targetDateMs > fromTimeMs && sprintsRemainingToTarget != null) {
+    } else if (targetDateMs > fromTimeMs) {
       const sprintsFloat = (targetDateMs - fromTimeMs) / sprintLenMs;
       if (sprintsFloat > 0) {
         const requiredPerSprint = remainingToTarget / sprintsFloat;
@@ -720,10 +716,11 @@ function computeProjection(
   }
 
   const projectedDonePerSprint = avgVelPerFTE * fte;
-  if (projectedDonePerSprint <= 0) {
+
+  if (!(projectedDonePerSprint > 0)) {
     return {
       hasSignal: false,
-      fromSprintIndex: l1,
+      fromSprintIndex: lastClosedIndex,
       fromTimeMs,
       fromDone,
       projectedDonePerSprint: null,
@@ -741,11 +738,11 @@ function computeProjection(
   }
 
   const remaining = Math.max(0, latestScope - fromDone);
+
   if (remaining === 0) {
-    // Already done
     return {
       hasSignal: true,
-      fromSprintIndex: l1,
+      fromSprintIndex: lastClosedIndex,
       fromTimeMs,
       fromDone,
       projectedDonePerSprint,
@@ -780,7 +777,7 @@ function computeProjection(
 
   return {
     hasSignal: true,
-    fromSprintIndex: l1,
+    fromSprintIndex: lastClosedIndex,
     fromTimeMs,
     fromDone,
     projectedDonePerSprint,

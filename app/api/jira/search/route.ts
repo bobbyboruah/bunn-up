@@ -14,19 +14,58 @@ function need(name: string) {
   return v;
 }
 
+function asStringArray(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out = v
+    .filter((x) => typeof x === "string")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return out.length ? out : [];
+}
+
+function toFlaggedBool(flagged: unknown): boolean {
+  // Jira commonly returns "flagged" as:
+  // - undefined/null when not flagged
+  // - an array (often of objects) when flagged
+  if (Array.isArray(flagged)) return flagged.length > 0;
+  if (flagged == null) return false;
+  return Boolean(flagged);
+}
+
 export async function POST(req: Request) {
   try {
-    const {
-      jql,
-      maxResults = 50,
-      // we force-add fields we need for KPIs; caller can still pass custom fields too
-      fields = ["key", "summary", "issuetype", "status", "project", "created", "updated", "resolutiondate"],
-      nextPageToken,
-    } = (await req.json()) as SearchBody;
+    const body = (await req.json()) as Partial<SearchBody> | null;
 
+    const jql = typeof body?.jql === "string" ? body.jql.trim() : "";
     if (!jql) {
-      return new Response(JSON.stringify({ error: "jql is required" }), { status: 400 });
+      return new Response(JSON.stringify({ error: "jql is required" }), {
+        status: 400,
+      });
     }
+
+    const maxResultsRaw = body?.maxResults;
+    const maxResults =
+      typeof maxResultsRaw === "number" && Number.isFinite(maxResultsRaw)
+        ? Math.max(1, Math.min(1000, Math.floor(maxResultsRaw)))
+        : 50;
+
+    // we force-add fields we need for KPIs; caller can still pass custom fields too
+    const defaultFields = [
+      "key",
+      "summary",
+      "issuetype",
+      "status",
+      "project",
+      "created",
+      "updated",
+      "resolutiondate",
+    ];
+    const fields = asStringArray(body?.fields) ?? defaultFields;
+
+    const nextPageToken =
+      typeof body?.nextPageToken === "string" && body.nextPageToken.trim()
+        ? body.nextPageToken.trim()
+        : undefined;
 
     const base = need("JIRA_BASE");
     const email = need("JIRA_EMAIL");
@@ -58,7 +97,10 @@ export async function POST(req: Request) {
     const data = await r.json();
 
     if (!r.ok) {
-      return new Response(JSON.stringify({ upstreamStatus: r.status, upstream: data }), { status: 502 });
+      return new Response(
+        JSON.stringify({ upstreamStatus: r.status, upstream: data }),
+        { status: 502 }
+      );
     }
 
     const items =
@@ -66,6 +108,7 @@ export async function POST(req: Request) {
         const f = it.fields ?? {};
         const st = f.status ?? {};
         const sc = st.statusCategory ?? {};
+
         return {
           key: it.key,
           summary: f.summary,
@@ -76,6 +119,10 @@ export async function POST(req: Request) {
           created: f.created,
           updated: f.updated,
           resolutiondate: f.resolutiondate ?? null,
+
+          // ✅ stable pass-through for UI/KPI consistency
+          labels: Array.isArray(f.labels) ? f.labels : [],
+          flagged: toFlaggedBool(f.flagged),
         };
       }) ?? [];
 
@@ -85,6 +132,9 @@ export async function POST(req: Request) {
       items,
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message ?? "Unexpected error" }), { status: 500 });
+    return new Response(
+      JSON.stringify({ error: e?.message ?? "Unexpected error" }),
+      { status: 500 }
+    );
   }
 }

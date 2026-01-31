@@ -51,7 +51,7 @@ const card: CSSProperties = {
 function fmtDate(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
+  if (Number.isNaN(d.getTime())) return iso ?? '—';
   return new Intl.DateTimeFormat('en-AU', {
     day: '2-digit',
     month: '2-digit',
@@ -95,32 +95,30 @@ function getProjectKey(issue: IssueRow | null): string {
   return '';
 }
 
-/** Flatten Jira description (string or Atlassian ADF JSON) into plain text */
-function extractPlainDescription(issue: IssueRow | null): string {
-  if (!issue) return '';
-  const raw: any = (issue as any).description;
+/** Flatten Jira ADF / rich text or plain string into text */
+function flattenJiraRichText(raw: any): string {
   if (!raw) return '';
+  if (typeof raw === 'string') return raw.trim();
 
-  if (typeof raw === 'string') {
-    return raw.trim();
-  }
-
-  // Best-effort flatten for Atlassian document format
   const acc: string[] = [];
 
   const walk = (node: any): void => {
     if (!node) return;
+
     if (typeof node === 'string') {
       acc.push(node);
       return;
     }
+
     if (Array.isArray(node)) {
       node.forEach(walk);
       return;
     }
+
     if (typeof node.text === 'string') {
       acc.push(node.text);
     }
+
     if (Array.isArray(node.content)) {
       node.content.forEach(walk);
     }
@@ -129,6 +127,14 @@ function extractPlainDescription(issue: IssueRow | null): string {
   walk(raw);
   const joined = acc.join(' ');
   return joined.replace(/\s+/g, ' ').trim();
+}
+
+/** Flatten Jira description (string or Atlassian ADF JSON) into plain text */
+function extractPlainDescription(issue: IssueRow | null): string {
+  if (!issue) return '';
+  const raw: any = (issue as any).description;
+  if (!raw) return '';
+  return flattenJiraRichText(raw);
 }
 
 function isDone(issue: IssueRow): boolean {
@@ -148,7 +154,11 @@ function isTodo(issue: IssueRow): boolean {
 
 /* ------------------ Jira search helper ------------------ */
 
-async function fetchAllIssues(jql: string, pageSize = 200, fields?: string[]): Promise<IssueRow[]> {
+async function fetchAllIssues(
+  jql: string,
+  pageSize = 200,
+  fields?: string[]
+): Promise<IssueRow[]> {
   let token: string | null = null;
   const out: IssueRow[] = [];
 
@@ -288,6 +298,61 @@ function summariseProblem(description: string, summary: string): string {
   return snippet || summary || 'No clear problem description has been provided yet.';
 }
 
+/* ------------------ comments helper ------------------ */
+
+type SimpleComment = {
+  author: string;
+  date: string;
+  text: string;
+};
+
+function getLatestComments(main: IssueRow | null, max = 3): SimpleComment[] {
+  if (!main) return [];
+
+  const anyIssue: any = main as any;
+  const rawComment = anyIssue.comment;
+
+  let commentsArray: any[] = [];
+  if (Array.isArray(rawComment)) {
+    commentsArray = rawComment;
+  } else if (rawComment && Array.isArray(rawComment.comments)) {
+    commentsArray = rawComment.comments;
+  }
+
+  if (!commentsArray.length) return [];
+
+  const mapped = commentsArray
+    .map((c) => {
+      const author =
+        (c?.author?.displayName as string) ||
+        (c?.author?.name as string) ||
+        'Unknown';
+
+      const updated = (c?.updated as string) || (c?.created as string) || null;
+      const text = flattenJiraRichText(c?.body ?? c?.bodyText ?? '');
+      if (!text) return null;
+
+      return {
+        author,
+        dateRaw: updated,
+        date: updated ? fmtDate(updated) : '—',
+        text,
+      };
+    })
+    .filter(
+      (x): x is { author: string; dateRaw: string | null; date: string; text: string } =>
+        !!x
+    );
+
+  mapped.sort((a, b) => {
+    const da = a.dateRaw ? new Date(a.dateRaw).getTime() : 0;
+    const db = b.dateRaw ? new Date(b.dateRaw).getTime() : 0;
+    return db - da;
+  });
+
+  return mapped.slice(0, max).map(({ author, date, text }) => ({ author, date, text }));
+}
+
 /* ------------------ plain-English "user guide" summary ------------------ */
 
 function buildUserGuide(main: IssueRow | null, children: IssueRow[]): string {
@@ -308,12 +373,12 @@ function buildUserGuide(main: IssueRow | null, children: IssueRow[]): string {
 
   // 1. Core problem / goal (1–2 sentences)
   const problemSentence = summariseProblem(description, summary);
-  lines.push(`In simple terms, Jira ${key} (${typeName.toLowerCase()}) is trying to solve the following problem:\n\n${problemSentence}`);
+  lines.push(
+    `In simple terms, Jira ${key} (${typeName.toLowerCase()}) is trying to solve the following problem:\n\n${problemSentence}`
+  );
 
   // 2. Status + where it stands
-  lines.push(
-    `Right now this item is ${statusName.toLowerCase()} in project ${project || '—'}.`
-  );
+  lines.push(`Right now this item is ${statusName.toLowerCase()} in project ${project || '—'}.`);
 
   // 3. How the work is broken down (children)
   if (totalChildren > 0) {
@@ -322,7 +387,9 @@ function buildUserGuide(main: IssueRow | null, children: IssueRow[]): string {
     const todoCount = children.filter(isTodo).length;
 
     lines.push(
-      `To deliver this outcome, the work is split across ${totalChildren} related Jira item${totalChildren === 1 ? '' : 's'} (stories, tasks or subtasks). Of these, ${doneCount} are done, ${inProgressCount} are in progress and ${todoCount} are still to do.`
+      `To deliver this outcome, the work is split across ${totalChildren} related Jira item${
+        totalChildren === 1 ? '' : 's'
+      } (stories, tasks or subtasks). Of these, ${doneCount} are done, ${inProgressCount} are in progress and ${todoCount} are still to do.`
     );
 
     const childBullets = children.map((c) => {
@@ -335,9 +402,7 @@ function buildUserGuide(main: IssueRow | null, children: IssueRow[]): string {
     });
 
     if (childBullets.length > 0) {
-      lines.push(
-        `You can think of the main pieces of work as:\n${childBullets.join('\n')}`
-      );
+      lines.push(`You can think of the main pieces of work as:\n${childBullets.join('\n')}`);
     }
   } else {
     lines.push(
@@ -347,21 +412,21 @@ function buildUserGuide(main: IssueRow | null, children: IssueRow[]): string {
 
   // 4. Timing context
   const leadTimeDays =
-    main.resolutiondate != null
-      ? diffInDays(main.created, main.resolutiondate)
-      : null;
+    main.resolutiondate != null ? diffInDays(main.created, main.resolutiondate) : null;
   const openDays =
-    main.resolutiondate == null
-      ? diffInDays(main.created, new Date().toISOString())
-      : null;
+    main.resolutiondate == null ? diffInDays(main.created, new Date().toISOString()) : null;
 
   if (resolved && leadTimeDays != null) {
     lines.push(
-      `It was created on ${created} and resolved on ${resolved}, taking about ${leadTimeDays} day${leadTimeDays === 1 ? '' : 's'} from creation to completion.`
+      `It was created on ${created} and resolved on ${resolved}, taking about ${leadTimeDays} day${
+        leadTimeDays === 1 ? '' : 's'
+      } from creation to completion.`
     );
   } else if (openDays != null) {
     lines.push(
-      `It was created on ${created} and has been open for roughly ${openDays} day${openDays === 1 ? '' : 's'} so far.`
+      `It was created on ${created} and has been open for roughly ${openDays} day${
+        openDays === 1 ? '' : 's'
+      } so far.`
     );
   } else if (created !== '—') {
     lines.push(`It was created on ${created}.`);
@@ -395,8 +460,24 @@ export default function JiraTicket() {
     setError(null);
 
     try {
-      // 1. Load the main issue by key
-      const mainList = await fetchAllIssues(`issuekey = ${key}`, 1);
+      // 1. Load the main issue by key, including comments
+      const mainList = await fetchAllIssues(`issuekey = ${key}`, 1, [
+        'key',
+        'summary',
+        'description',
+        'issuetype',
+        'status',
+        'project',
+        'created',
+        'updated',
+        'resolutiondate',
+        'flagged',
+        'statuscategory',
+        'labels',
+        'parent',
+        'comment',
+      ]);
+
       if (!mainList.length) {
         setMainIssue(null);
         setChildren([]);
@@ -450,6 +531,7 @@ export default function JiraTicket() {
 
   const healthSummary = buildHealthSummary(mainIssue, children);
   const userGuide = buildUserGuide(mainIssue, children);
+  const latestComments = getLatestComments(mainIssue, 3);
 
   return (
     <section
@@ -499,14 +581,11 @@ export default function JiraTicket() {
         </button>
       </div>
 
-      {error && (
-        <div style={{ color: '#b91c1c', fontSize: 13 }}>{error}</div>
-      )}
+      {error && <div style={{ color: '#b91c1c', fontSize: 13 }}>{error}</div>}
 
       {!mainIssue && !error && (
         <div style={{ color: '#6b7280', fontSize: 13 }}>
-          Enter a Jira key above and click <b>Load</b> to see details and
-          related issues.
+          Enter a Jira key above and click <b>Load</b> to see details and related issues.
         </div>
       )}
 
@@ -587,16 +666,13 @@ export default function JiraTicket() {
 
           {/* Children / progress */}
           <div style={card}>
-            <div style={{ fontSize: 12, color: '#6b7280' }}>
-              Linked work items
-            </div>
+            <div style={{ fontSize: 12, color: '#6b7280' }}>Linked work items</div>
             <div style={{ fontSize: 16, fontWeight: 600 }}>
-              {totalChildren}{' '}
-              {totalChildren === 1 ? 'item' : 'items'}
+              {totalChildren} {totalChildren === 1 ? 'item' : 'items'}
             </div>
             <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
-              Done: <b>{doneCount}</b> · In progress:{' '}
-              <b>{inProgressCount}</b> · To do: <b>{todoCount}</b>
+              Done: <b>{doneCount}</b> · In progress: <b>{inProgressCount}</b> · To do:{' '}
+              <b>{todoCount}</b>
             </div>
           </div>
         </div>
@@ -633,9 +709,7 @@ export default function JiraTicket() {
                     }}
                   >
                     <div style={{ fontSize: 13 }}>
-                      <span style={{ fontWeight: 600 }}>
-                        {child.key}
-                      </span>{' '}
+                      <span style={{ fontWeight: 600 }}>{child.key}</span>{' '}
                       · {childType || 'Issue'} ·{' '}
                       <span style={{ color: '#374151' }}>
                         {childStatus || 'Unknown'}
@@ -657,6 +731,32 @@ export default function JiraTicket() {
               })}
             </ul>
           )}
+        </div>
+      )}
+
+      {/* Latest comments */}
+      {mainIssue && latestComments.length > 0 && (
+        <div style={{ ...card, marginTop: 4 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+            Latest comments
+          </div>
+          {latestComments.map((c, idx) => (
+            <div key={idx} style={{ marginBottom: idx === latestComments.length - 1 ? 0 : 8 }}>
+              <div style={{ fontSize: 12, color: '#374151', marginBottom: 2 }}>
+                <b>{c.author}</b>{' '}
+                <span style={{ color: '#6b7280' }}>· {c.date}</span>
+              </div>
+              <div
+                style={{
+                  fontSize: 12,
+                  color: '#111827',
+                  whiteSpace: 'pre-wrap',
+                }}
+              >
+                {c.text}
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

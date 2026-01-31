@@ -10,7 +10,7 @@ import {
   type BurnupModel,
   type SprintSummary,
 } from './buildBurnupModel';
-import type { ProjectKey, Scope, IssueRow } from '../types';
+import type { Scope, IssueRow } from '../types';
 import { KpiRow } from './KpiRow';
 import { BurnupChart } from './BurnupChart';
 import JiraTicket from './JiraTicket';
@@ -36,6 +36,19 @@ const todayISO = (): string => {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Convert an epoch-ms timestamp that is already "date-only aligned"
+ * (UTC epoch-day flooring) into YYYY-MM-DD using UTC fields.
+ * This keeps Sprint Plan dates consistent with buildBurnupModel (UTC epoch-day).
+ */
+const msToISO_UTC = (ms: number): string => {
+  const d = new Date(ms);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+};
+
 /* ------------------ API types ------------------ */
 
 type SearchResponse = {
@@ -49,21 +62,52 @@ type SearchResponse = {
 
 const DEFAULT_DEV_COMPLETE = '2026-05-31';
 
+/* ------------------ Project list (Option A: local UI add) ------------------ */
+
+const BUILTIN_PROJECTS = ['SO', 'PPP', 'PWS', 'PORE', 'PWPU'] as const;
+const CUSTOM_PROJECTS_LS_KEY = 'burnup_custom_projects_v1';
+const ADD_PROJECT_SENTINEL = '__add_project__';
+
+/** Basic Jira project key validation (fairly permissive, but safe) */
+function normalizeProjectKey(input: string): string {
+  return String(input ?? '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+}
+function isValidProjectKey(key: string): boolean {
+  // Jira keys are usually 2–10 (sometimes longer). Keep it practical.
+  // Must start with a letter, then letters/numbers/underscore allowed.
+  return /^[A-Z][A-Z0-9_]{1,19}$/.test(key);
+}
+function uniqStrings(xs: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of xs) {
+    const k = String(x);
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
 /* ------------------ JQL builders ------------------ */
 
-function buildJql(p: ProjectKey, s: Scope) {
+function buildJql(p: string, s: Scope) {
   return `project = ${p} AND type = ${s} AND status NOT IN (Withdrawn, CANCELLED) ORDER BY created ASC`;
 }
-function buildJqlPMApproved(p: ProjectKey) {
+function buildJqlPMApproved(p: string) {
   return `project = ${p} AND type = Requirement AND status NOT IN (Withdrawn, CANCELLED) AND labels = PMApproved ORDER BY updated DESC`;
 }
-function buildJqlNotPMApproved(p: ProjectKey) {
+function buildJqlNotPMApproved(p: string) {
   return `project = ${p} AND type = Requirement AND status NOT IN (Withdrawn, CANCELLED) AND (labels NOT IN (PMApproved) OR labels IS EMPTY) ORDER BY created ASC`;
 }
-function buildJqlStoriesAll(p: ProjectKey) {
+function buildJqlStoriesAll(p: string) {
   return `project = ${p} AND type = Story AND status NOT IN (Withdrawn, CANCELLED)`;
 }
-function buildJqlStoriesDone(p: ProjectKey) {
+function buildJqlStoriesDone(p: string) {
   return `project = ${p} AND type = Story AND status NOT IN (Withdrawn, CANCELLED) AND statusCategory = Done`;
 }
 
@@ -105,7 +149,7 @@ function Label({ children }: { children: ReactNode }) {
 
 type ViewMode = 'burnup' | 'jira';
 
-type BurnupLock = { project: ProjectKey; scope: Scope } | null;
+type BurnupLock = { project: string; scope: Scope } | null;
 
 /* ------------------ helper: Velocity slider bounds ------------------ */
 
@@ -147,10 +191,7 @@ function getVelocitySliderBounds(model: BurnupModel | null): {
     return { min: defaultMin, max: defaultMax };
   }
 
-  const sprintsRemaining = Math.max(
-    1,
-    Math.ceil(remainingTimeMs / sprintLenMs)
-  );
+  const sprintsRemaining = Math.max(1, Math.ceil(remainingTimeMs / sprintLenMs));
   const requiredStoriesPerSprint = remainingStories / sprintsRemaining;
 
   const recent = (proj as any).recentStoriesPerSprint ?? null;
@@ -289,7 +330,7 @@ type VelocityInsights = {
 export default function Dashboard() {
   const [viewMode, setViewMode] = useState<ViewMode>('burnup');
 
-  const [project, setProject] = useState<ProjectKey>('PWS');
+  const [project, setProject] = useState<string>('PWS');
   const [scope, setScope] = useState<Scope>('Requirement');
 
   const [devStartISO, setDevStartISO] = useState<string>('');
@@ -309,10 +350,9 @@ export default function Dashboard() {
   const [storyTotalCt, setStoryTotalCt] = useState<number>(0);
 
   // Burn-up inputs
-  const [sprintStartISO, setSprintStartISO] = useState<string>(todayISO());
-  const [sprintEndISO, setSprintEndISO] = useState<string>(
-    addDays(todayISO(), 13)
-  );
+  // IMPORTANT UI change: keep blank until Create Burnup calculates the window.
+  const [sprintStartISO, setSprintStartISO] = useState<string>('');
+  const [sprintEndISO, setSprintEndISO] = useState<string>('');
 
   // Slider value is now *velocity* (stories / sprint), not FTE.
   const [sprintFTE, setSprintFTE] = useState<number>(10);
@@ -323,6 +363,100 @@ export default function Dashboard() {
   const [burnupLock, setBurnupLock] = useState<BurnupLock>(null);
 
   const [scopeOverride, setScopeOverride] = useState<number | null>(null);
+
+  /* ---------- Project list state (custom projects) ---------- */
+
+  const [customProjects, setCustomProjects] = useState<string[]>([]);
+  const [showAddProject, setShowAddProject] = useState<boolean>(false);
+  const [newProjectKey, setNewProjectKey] = useState<string>('');
+  const [projectAddError, setProjectAddError] = useState<string | null>(null);
+
+  const allProjects = useMemo(() => {
+    const base = Array.from(BUILTIN_PROJECTS) as unknown as string[];
+    const customs = (customProjects ?? []).map((p) => normalizeProjectKey(p));
+    return uniqStrings([...base, ...customs]).sort((a, b) => a.localeCompare(b));
+  }, [customProjects]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    // Load custom projects
+    try {
+      const raw = window.localStorage.getItem(CUSTOM_PROJECTS_LS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const cleaned = uniqStrings(
+            parsed
+              .map((x) => normalizeProjectKey(String(x ?? '')))
+              .filter((k) => isValidProjectKey(k))
+          );
+          setCustomProjects(cleaned);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(
+        CUSTOM_PROJECTS_LS_KEY,
+        JSON.stringify(customProjects ?? [])
+      );
+    } catch {
+      // ignore
+    }
+  }, [customProjects]);
+
+  // If current project is not in the list (e.g. cleared storage), fall back to PWS.
+  useEffect(() => {
+    if (!project) return;
+    if (allProjects.includes(project)) return;
+
+    // Prefer PWS if available, else first available.
+    const fallback = allProjects.includes('PWS')
+      ? 'PWS'
+      : allProjects[0] ?? 'PWS';
+    setProject(fallback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allProjects]);
+
+  function commitAddProject() {
+    const normalized = normalizeProjectKey(newProjectKey);
+
+    if (!normalized) {
+      setProjectAddError('Enter a project key (e.g., ABC).');
+      return;
+    }
+    if (!isValidProjectKey(normalized)) {
+      setProjectAddError(
+        'Invalid key. Use letters/numbers/underscore, start with a letter (e.g., ABC, PWS2).'
+      );
+      return;
+    }
+
+    // If it's built-in, just select it.
+    if (Array.from(BUILTIN_PROJECTS).includes(normalized as any)) {
+      setProject(normalized);
+      setProjectAddError(null);
+      setNewProjectKey('');
+      setShowAddProject(false);
+      return;
+    }
+
+    setCustomProjects((prev) => {
+      const next = uniqStrings([...(prev ?? []), normalized]);
+      return next;
+    });
+
+    setProject(normalized);
+    setProjectAddError(null);
+    setNewProjectKey('');
+    setShowAddProject(false);
+  }
 
   const { min: sliderMinVelocity, max: sliderMaxVelocity } =
     getVelocitySliderBounds(burnupModel);
@@ -341,7 +475,11 @@ export default function Dashboard() {
   }, [burnupModel, scopeOverride, scopeSliderConfig.enabled]);
 
   const velocityInsights = useMemo<VelocityInsights | null>(() => {
-    if (!burnupModel || !burnupModel.projection || !burnupModel.projection.hasSignal) {
+    if (
+      !burnupModel ||
+      !burnupModel.projection ||
+      !burnupModel.projection.hasSignal
+    ) {
       return null;
     }
 
@@ -442,7 +580,11 @@ export default function Dashboard() {
     }
   }, [sprintFTE]);
 
+  // Keep end >= start only when we actually have a start date (i.e., user has set it).
+  // Default behaviour stays the same, but we don't auto-fill from today's date anymore.
   useEffect(() => {
+    if (!sprintStartISO) return;
+
     const minEnd = addDays(sprintStartISO, 1);
     if (!sprintEndISO || sprintEndISO < minEnd) {
       setSprintEndISO(addDays(sprintStartISO, 13));
@@ -455,6 +597,10 @@ export default function Dashboard() {
     setBurnupError(null);
     setBurnupLock(null);
     setScopeOverride(null);
+
+    // IMPORTANT UI change: blank out sprint plan dates until Create Burnup is clicked again.
+    setSprintStartISO('');
+    setSprintEndISO('');
   }, [project, scope]);
 
   useEffect(() => {
@@ -465,11 +611,7 @@ export default function Dashboard() {
     setScopeOverride((prev) =>
       prev == null ? scopeSliderConfig.baselineScope : prev
     );
-  }, [
-    burnupModel,
-    scopeSliderConfig.enabled,
-    scopeSliderConfig.baselineScope,
-  ]);
+  }, [burnupModel, scopeSliderConfig.enabled, scopeSliderConfig.baselineScope]);
 
   useEffect(() => {
     setSprintFTE((current) => {
@@ -515,7 +657,7 @@ export default function Dashboard() {
 
   /* ---------- API helpers ---------- */
 
-  async function fetchEarliest(startProject: ProjectKey, startScope: Scope) {
+  async function fetchEarliest(startProject: string, startScope: Scope) {
     const res = await fetch('/api/jira/earliest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -628,7 +770,7 @@ export default function Dashboard() {
 
   /* ---------- Burn-up handler ---------- */
 
-  const minSprintEnd = addDays(sprintStartISO, 1);
+  const minSprintEnd = sprintStartISO ? addDays(sprintStartISO, 1) : '';
 
   function onClickCreateBurnup() {
     if (scope !== 'Story') {
@@ -640,9 +782,7 @@ export default function Dashboard() {
     }
 
     if (!devCompletionISO) {
-      setBurnupError(
-        'Set Dev Completion (target) above before creating burn-up.'
-      );
+      setBurnupError('Set Dev Completion (target) above before creating burn-up.');
       setBurnupModel(null);
       return;
     }
@@ -653,7 +793,7 @@ export default function Dashboard() {
       return;
     }
 
-    // NEW: if there is scope but no Done stories yet, do not create a burn-up
+    // If there is scope but no Done stories yet, do not create a burn-up
     if (storyTotalCt > 0 && storyDoneCt === 0) {
       setBurnupError(
         `No burn up to show as no Story Done yet. Current scope is = ${storyTotalCt}.`
@@ -675,10 +815,30 @@ export default function Dashboard() {
 
     const baseModel = buildBurnupModel({
       stories,
-      sprintStartISO,
+      sprintStartISO: sprintStartISO || todayISO(), // only used when no Done yet; safe fallback
       devCompletionISO,
       sprintFTE: 1,
     });
+
+    // Set Sprint Plan dates to the CURRENT sprint window derived from model.originMs.
+    // Keep date-only in UTC to match buildBurnupModel's epoch-day maths.
+    if (
+      Number.isFinite(baseModel.originMs) &&
+      Number.isFinite(baseModel.todayMs) &&
+      baseModel.sprintLengthDays > 0
+    ) {
+      const sprintLenMs = baseModel.sprintLengthDays * DAY_MS;
+
+      const deltaMs = baseModel.todayMs - baseModel.originMs;
+      const idx = Math.max(0, Math.floor(deltaMs / sprintLenMs));
+
+      const currentStartMs = baseModel.originMs + idx * sprintLenMs;
+      const currentEndInclusiveMs =
+        currentStartMs + (baseModel.sprintLengthDays - 1) * DAY_MS;
+
+      setSprintStartISO(msToISO_UTC(currentStartMs));
+      setSprintEndISO(msToISO_UTC(currentEndInclusiveMs));
+    }
 
     const proj: any = baseModel.projection;
 
@@ -708,10 +868,7 @@ export default function Dashboard() {
       setSprintFTE(baselineVelocity);
 
       const fteForBaseline = baselineVelocity / proj.avgVelPerFTE;
-      const adjustedModel = recomputeProjectionWithFTE(
-        baseModel,
-        fteForBaseline
-      );
+      const adjustedModel = recomputeProjectionWithFTE(baseModel, fteForBaseline);
 
       setBurnupModel(adjustedModel);
     } else {
@@ -781,9 +938,7 @@ export default function Dashboard() {
   };
 
   const burnupAlreadyCreated =
-    !!burnupLock &&
-    burnupLock.project === project &&
-    burnupLock.scope === scope;
+    !!burnupLock && burnupLock.project === project && burnupLock.scope === scope;
 
   // true only for the “no Story Done yet” scenario
   const noBurnupAvailable =
@@ -792,6 +947,9 @@ export default function Dashboard() {
   const burnupDisabledForProject = burnupAlreadyCreated;
 
   const sprintDatesLocked = burnupDisabledForProject || noBurnupAvailable;
+
+  // IMPORTANT UI change: until burnup is created, keep sprint date fields blank+disabled.
+  const sprintDatesReady = !!burnupModel && !noBurnupAvailable;
 
   const scopeSliderValue =
     scopeOverride ??
@@ -866,9 +1024,7 @@ export default function Dashboard() {
           </span>
           <div
             style={trackStyle}
-            onClick={() =>
-              setViewMode((m) => (m === 'burnup' ? 'jira' : 'burnup'))
-            }
+            onClick={() => setViewMode((m) => (m === 'burnup' ? 'jira' : 'burnup'))}
           >
             <div style={thumbStyle} />
           </div>
@@ -909,17 +1065,70 @@ export default function Dashboard() {
               <Label>Project</Label>
               <select
                 value={project}
-                onChange={(e) => setProject(e.target.value as ProjectKey)}
-                style={dd(150)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === ADD_PROJECT_SENTINEL) {
+                    setShowAddProject(true);
+                    setProjectAddError(null);
+                    return;
+                  }
+                  setProject(v);
+                }}
+                style={dd(170)}
               >
-                {(['SO', 'PPP', 'PWS', 'PORE', 'PWPU'] as ProjectKey[]).map(
-                  (p) => (
-                    <option key={p} value={p}>
-                      {p}
-                    </option>
-                  )
-                )}
+                {allProjects.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+                <option value={ADD_PROJECT_SENTINEL}>+ Add project…</option>
               </select>
+
+              {showAddProject && (
+                <>
+                  <Label>Add</Label>
+                  <input
+                    value={newProjectKey}
+                    onChange={(e) => {
+                      setNewProjectKey(e.target.value);
+                      setProjectAddError(null);
+                    }}
+                    placeholder="e.g. ABC"
+                    style={dd(120)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitAddProject();
+                      if (e.key === 'Escape') {
+                        setShowAddProject(false);
+                        setNewProjectKey('');
+                        setProjectAddError(null);
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    style={btn()}
+                    onClick={commitAddProject}
+                    title="Add this Jira project key to the dropdown (saved locally)"
+                  >
+                    Add
+                  </button>
+                  <button
+                    type="button"
+                    style={{
+                      ...btn(),
+                      background: '#6b7280',
+                    }}
+                    onClick={() => {
+                      setShowAddProject(false);
+                      setNewProjectKey('');
+                      setProjectAddError(null);
+                    }}
+                    title="Cancel adding a project"
+                  >
+                    Cancel
+                  </button>
+                </>
+              )}
 
               <Label>Scope</Label>
               <select
@@ -951,14 +1160,14 @@ export default function Dashboard() {
               </button>
             </div>
 
+            {showAddProject && projectAddError && (
+              <div style={{ marginTop: 10, color: '#b91c1c', fontSize: 13 }}>
+                {projectAddError}
+              </div>
+            )}
+
             {err && (
-              <div
-                style={{
-                  marginTop: 12,
-                  color: '#b91c1c',
-                  fontSize: 13,
-                }}
-              >
+              <div style={{ marginTop: 12, color: '#b91c1c', fontSize: 13 }}>
                 {err}
               </div>
             )}
@@ -988,13 +1197,7 @@ export default function Dashboard() {
               boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
             }}
           >
-            <div
-              style={{
-                fontSize: 18,
-                fontWeight: 600,
-                marginBottom: 8,
-              }}
-            >
+            <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
               Burn-up
             </div>
 
@@ -1007,22 +1210,10 @@ export default function Dashboard() {
               }}
             >
               {/* Left column: Sprint plan + Velocity snapshot cards */}
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 12,
-                }}
-              >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {/* Sprint plan card */}
                 <div style={leftCardStyle}>
-                  <div
-                    style={{
-                      fontSize: 13,
-                      fontWeight: 600,
-                      marginBottom: 8,
-                    }}
-                  >
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
                     Sprint plan
                   </div>
                   <div
@@ -1037,45 +1228,44 @@ export default function Dashboard() {
                     <div style={sprintFieldLabel}>Sprint start</div>
                     <input
                       type="date"
-                      value={sprintStartISO}
+                      value={sprintDatesReady ? sprintStartISO : ''}
                       onChange={(e) => setSprintStartISO(e.target.value)}
                       style={{
                         ...inp(),
                         width: '90%',
-                        backgroundColor: sprintDatesLocked
-                          ? '#e5e7eb'
-                          : 'white',
+                        backgroundColor:
+                          sprintDatesLocked || !sprintDatesReady ? '#e5e7eb' : 'white',
                       }}
-                      title="Start date of the sprint"
-                      disabled={sprintDatesLocked}
+                      title={
+                        sprintDatesReady
+                          ? 'Start date of the current sprint (derived).'
+                          : 'Calculated when you click Create Burnup.'
+                      }
+                      disabled={sprintDatesLocked || !sprintDatesReady}
                     />
 
                     <div style={sprintFieldLabel}>Sprint end</div>
                     <input
                       type="date"
-                      value={sprintEndISO}
+                      value={sprintDatesReady ? sprintEndISO : ''}
                       onChange={(e) => setSprintEndISO(e.target.value)}
-                      min={minSprintEnd}
+                      min={sprintDatesReady && minSprintEnd ? minSprintEnd : undefined}
                       style={{
                         ...inp(),
                         width: '90%',
-                        backgroundColor: sprintDatesLocked
-                          ? '#e5e7eb'
-                          : 'white',
+                        backgroundColor:
+                          sprintDatesLocked || !sprintDatesReady ? '#e5e7eb' : 'white',
                       }}
-                      title="Defaults to +2 weeks; must be at least 1 day after start"
-                      disabled={sprintDatesLocked}
+                      title={
+                        sprintDatesReady
+                          ? 'End date of the current sprint (derived).'
+                          : 'Calculated when you click Create Burnup.'
+                      }
+                      disabled={sprintDatesLocked || !sprintDatesReady}
                     />
 
                     <div style={sprintFieldLabel}>Velocity (stories / sprint)</div>
-                    <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 8,
-                        minWidth: 0,
-                      }}
-                    >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                       <input
                         type="range"
                         min={sliderMinVelocity}
@@ -1106,23 +1296,14 @@ export default function Dashboard() {
                     {burnupModel && scopeSliderConfig.enabled && (
                       <>
                         <div style={sprintFieldLabel}>Scope (next sprint)</div>
-                        <div
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 8,
-                            minWidth: 0,
-                          }}
-                        >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                           <input
                             type="range"
                             min={scopeSliderConfig.min}
                             max={scopeSliderConfig.max}
                             step={1}
                             value={scopeSliderValue}
-                            onChange={(e) =>
-                              setScopeOverride(Number(e.target.value))
-                            }
+                            onChange={(e) => setScopeOverride(Number(e.target.value))}
                             style={{ flex: 1 }}
                             title="Adjust total scope for the next sprint; later sprints stay flat at this value."
                           />
@@ -1149,12 +1330,8 @@ export default function Dashboard() {
                         onClick={onClickCreateBurnup}
                         style={{
                           ...btn(),
-                          backgroundColor: burnupButtonDisabled
-                            ? '#9ca3af'
-                            : '#2563EB',
-                          cursor: burnupButtonDisabled
-                            ? 'not-allowed'
-                            : 'pointer',
+                          backgroundColor: burnupButtonDisabled ? '#9ca3af' : '#2563EB',
+                          cursor: burnupButtonDisabled ? 'not-allowed' : 'pointer',
                         }}
                         title="Generate the burn-up projection using these parameters"
                         disabled={burnupButtonDisabled}
@@ -1167,34 +1344,15 @@ export default function Dashboard() {
 
                 {/* Velocity snapshot card */}
                 <div style={leftCardStyle}>
-                  <div
-                    style={{
-                      fontSize: 13,
-                      fontWeight: 600,
-                      marginBottom: 6,
-                    }}
-                  >
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                     Velocity snapshot
                   </div>
                   {noBurnupAvailable ? (
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: '#9ca3af',
-                      }}
-                    >
-                      No burn up to show as no Story Done yet. Current scope is ={' '}
-                      {storyTotalCt}.
+                    <div style={{ fontSize: 12, color: '#9ca3af' }}>
+                      No burn up to show as no Story Done yet. Current scope is = {storyTotalCt}.
                     </div>
                   ) : burnupModel && velocityInsights ? (
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: '#374151',
-                        display: 'grid',
-                        rowGap: 4,
-                      }}
-                    >
+                    <div style={{ fontSize: 12, color: '#374151', display: 'grid', rowGap: 4 }}>
                       <div>
                         <strong>Last sprint (closed): </strong>
                         {velocityInsights.lastSprintStories != null
@@ -1203,75 +1361,45 @@ export default function Dashboard() {
                       </div>
                       <div>
                         <strong>Done so far: </strong>
-                        {velocityInsights.doneSoFar != null &&
-                        velocityInsights.totalScope != null
+                        {velocityInsights.doneSoFar != null && velocityInsights.totalScope != null
                           ? `${velocityInsights.doneSoFar} of ${velocityInsights.totalScope} stories`
                           : 'n/a'}
                       </div>
                       <div>
                         <strong>Recent average: </strong>
                         {velocityInsights.recentVelocity != null
-                          ? `${velocityInsights.recentVelocity.toFixed(
-                              1
-                            )} stories / sprint`
+                          ? `${velocityInsights.recentVelocity.toFixed(1)} stories / sprint`
                           : 'n/a'}
                       </div>
                       <div>
                         <strong>Needed to hit {fmt(devCompletionISO)}: </strong>
                         {velocityInsights.neededVelocity != null
-                          ? `${velocityInsights.neededVelocity.toFixed(
-                              1
-                            )} stories / sprint`
+                          ? `${velocityInsights.neededVelocity.toFixed(1)} stories / sprint`
                           : 'n/a'}
                       </div>
                       <div>
-                        <strong>
-                          At current setting ({sprintFTE.toFixed(1)}):{' '}
-                        </strong>
+                        <strong>At current setting ({sprintFTE.toFixed(1)}): </strong>
                         {velocityInsights.finishLabel ?? 'n/a'}
                       </div>
                     </div>
                   ) : (
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: '#9ca3af',
-                      }}
-                    >
-                      Run <strong>Update</strong> and then{' '}
-                      <strong>Create Burnup</strong> to see recent velocity.
+                    <div style={{ fontSize: 12, color: '#9ca3af' }}>
+                      Run <strong>Update</strong> and then <strong>Create Burnup</strong> to see recent velocity.
                     </div>
                   )}
                 </div>
               </div>
 
               {/* Right column: errors + chart */}
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  minHeight: 0,
-                }}
-              >
+              <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
                 {burnupError && (
-                  <div
-                    style={{
-                      color: '#b91c1c',
-                      fontSize: 13,
-                      marginBottom: 8,
-                    }}
-                  >
+                  <div style={{ color: '#b91c1c', fontSize: 13, marginBottom: 8 }}>
                     {burnupError}
                   </div>
                 )}
 
                 {displayBurnupModel && (
-                  <div
-                    style={{
-                      width: '100%',
-                      height: 340,
-                    }}
-                  >
+                  <div style={{ width: '100%', height: 340 }}>
                     <BurnupChart model={displayBurnupModel} />
                   </div>
                 )}

@@ -2,7 +2,7 @@
 export const runtime = "nodejs";
 
 type Body = {
-  project: "SO" | "PPP" | "PWS" | "PORE" | "PWPU";
+  project: string; // ✅ allow any project key
   scope: "Requirement" | "Story";
 };
 
@@ -14,10 +14,16 @@ function need(name: string) {
 
 export async function POST(req: Request) {
   try {
-    const { project, scope } = (await req.json()) as Body;
+    const body = (await req.json()) as Partial<Body>;
+
+    const project = typeof body.project === "string" ? body.project.trim() : "";
+    const scope = body.scope;
 
     if (!project || !scope) {
-      return new Response(JSON.stringify({ error: "project and scope are required" }), { status: 400 });
+      return new Response(
+        JSON.stringify({ error: "project and scope are required" }),
+        { status: 400 }
+      );
     }
 
     const base = need("JIRA_BASE");
@@ -35,7 +41,7 @@ export async function POST(req: Request) {
       jql,
       maxResults: 1,
       fields: ["key", "created"], // minimal fields
-      fieldsByKeys: true
+      fieldsByKeys: true,
     };
 
     const r = await fetch(`${base}/rest/api/3/search/jql`, {
@@ -43,16 +49,19 @@ export async function POST(req: Request) {
       headers: {
         Authorization: `Basic ${auth}`,
         Accept: "application/json",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
-      cache: "no-store"
+      cache: "no-store",
     });
 
     const data = await r.json();
 
     if (!r.ok) {
-      return new Response(JSON.stringify({ upstreamStatus: r.status, upstream: data }), { status: 502 });
+      return new Response(
+        JSON.stringify({ upstreamStatus: r.status, upstream: data }),
+        { status: 502 }
+      );
     }
 
     const first = (data.issues ?? [])[0];
@@ -62,9 +71,12 @@ export async function POST(req: Request) {
       project,
       scope,
       jql,
-      earliestCreated // ISO string or null if no issues matched
+      earliestCreated, // ISO string or null if no issues matched
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message ?? "Unexpected error" }), { status: 500 });
+    return new Response(
+      JSON.stringify({ error: e?.message ?? "Unexpected error" }),
+      { status: 500 }
+    );
   }
 }
