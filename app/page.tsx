@@ -1390,20 +1390,37 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Right column: errors + chart */}
-              <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-                {burnupError && (
-                  <div style={{ color: '#b91c1c', fontSize: 13, marginBottom: 8 }}>
-                    {burnupError}
-                  </div>
-                )}
+             /* Right column: errors + chart */
+<div
+  style={{
+    display: 'flex',
+    flexDirection: 'column',
+    minHeight: 0,
+    minWidth: 0,           // ✅ important for grid children
+    overflow: 'hidden',    // ✅ stop chart bleeding into left column
+  }}
+>
+  {burnupError && (
+    <div style={{ color: '#b91c1c', fontSize: 13, marginBottom: 8 }}>
+      {burnupError}
+    </div>
+  )}
 
-                {displayBurnupModel && (
-                  <div style={{ width: '100%', height: 340, overflow: 'hidden' }}>
-                    <BurnupChart model={displayBurnupModel} />
-                  </div>
-                )}
-              </div>
+  {displayBurnupModel && (
+    <div
+      style={{
+        width: '100%',
+        height: 340,
+        minWidth: 0,          // ✅ allow shrink inside grid
+        overflow: 'hidden',   // ✅ contain SVG/canvas
+        position: 'relative', // ✅ keeps internal absolute elements contained (if any)
+      }}
+    >
+      <BurnupChart model={displayBurnupModel} />
+    </div>
+  )}
+</div>
+
             </div>
           </section>
         </>
