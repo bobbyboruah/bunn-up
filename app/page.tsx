@@ -1399,7 +1399,7 @@ export default function Dashboard() {
                 )}
 
                 {displayBurnupModel && (
-                  <div style={{ width: '100%', height: 340 }}>
+                  <div style={{ width: '100%', height: 340, overflow: 'hidden' }}>
                     <BurnupChart model={displayBurnupModel} />
                   </div>
                 )}
