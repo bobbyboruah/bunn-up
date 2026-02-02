@@ -5,8 +5,9 @@
  * Scope of the burn-up / health view:
  *  - 'Requirement' = higher-level requirement / epic
  *  - 'Story'       = delivery / story level
+ *  - 'Task'        = delivery / task level
  */
-export type Scope = 'Requirement' | 'Story';
+export type Scope = 'Requirement' | 'Story' | 'Task';
 
 /**
  * Built-in project keys we currently ship with.

@@ -110,6 +110,13 @@ function buildJqlStoriesAll(p: string) {
 function buildJqlStoriesDone(p: string) {
   return `project = ${p} AND type = Story AND status NOT IN (Withdrawn, CANCELLED) AND statusCategory = Done`;
 }
+// NEW: Task equivalents (for KPI + burn-up support)
+function buildJqlTasksAll(p: string) {
+  return `project = ${p} AND type = Task AND status NOT IN (Withdrawn, CANCELLED)`;
+}
+function buildJqlTasksDone(p: string) {
+  return `project = ${p} AND type = Task AND status NOT IN (Withdrawn, CANCELLED) AND statusCategory = Done`;
+}
 
 /* ------------------ style helpers ------------------ */
 
@@ -346,6 +353,8 @@ export default function Dashboard() {
   const [pmApprovedCt, setPmApprovedCt] = useState<number>(0);
   const [notPmApprovedCt, setNotPmApprovedCt] = useState<number>(0);
 
+  // NOTE: these variable names are preserved to avoid changing KpiRow props.
+  // For scope=Story they are Story counts; for scope=Task they are Task counts.
   const [storyDoneCt, setStoryDoneCt] = useState<number>(0);
   const [storyTotalCt, setStoryTotalCt] = useState<number>(0);
 
@@ -735,26 +744,50 @@ export default function Dashboard() {
       );
 
       const jql = buildJql(project, scope);
+
+      const needsPMApproved = scope === 'Requirement';
+      const wantsWorkCounts = scope === 'Story' || scope === 'Task';
+
       const jqlApp = buildJqlPMApproved(project);
       const jqlNot = buildJqlNotPMApproved(project);
 
-      const jqlStoriesAllStr = buildJqlStoriesAll(project);
-      const jqlStoriesDoneStr = buildJqlStoriesDone(project);
+      const jqlWorkAllStr =
+        scope === 'Task' ? buildJqlTasksAll(project) : buildJqlStoriesAll(project);
+      const jqlWorkDoneStr =
+        scope === 'Task'
+          ? buildJqlTasksDone(project)
+          : buildJqlStoriesDone(project);
 
-      const [all, onlyApproved, onlyNotApproved, storiesAll, storiesDone] =
-        await Promise.all([
-          fetchAllIssues(jql),
-          fetchAllIssues(jqlApp, 400, ['key']),
-          fetchAllIssues(jqlNot, 400, ['key']),
-          fetchAllIssues(jqlStoriesAllStr, 400, ['key']),
-          fetchAllIssues(jqlStoriesDoneStr, 400, ['key']),
-        ]);
+      const promises: Array<Promise<any>> = [fetchAllIssues(jql)];
 
-      setIssues(all);
-      setPmApprovedCt(onlyApproved.length);
-      setNotPmApprovedCt(onlyNotApproved.length);
-      setStoryTotalCt(storiesAll.length);
-      setStoryDoneCt(storiesDone.length);
+      if (needsPMApproved) {
+        promises.push(fetchAllIssues(jqlApp, 400, ['key']));
+        promises.push(fetchAllIssues(jqlNot, 400, ['key']));
+      } else {
+        // placeholders so we keep array positions stable
+        promises.push(Promise.resolve([]));
+        promises.push(Promise.resolve([]));
+      }
+
+      if (wantsWorkCounts) {
+        promises.push(fetchAllIssues(jqlWorkAllStr, 400, ['key']));
+        promises.push(fetchAllIssues(jqlWorkDoneStr, 400, ['key']));
+      } else {
+        promises.push(Promise.resolve([]));
+        promises.push(Promise.resolve([]));
+      }
+
+      const [all, onlyApproved, onlyNotApproved, workAll, workDone] =
+        await Promise.all(promises);
+
+      setIssues(all as IssueRow[]);
+      setPmApprovedCt((onlyApproved as IssueRow[]).length);
+      setNotPmApprovedCt((onlyNotApproved as IssueRow[]).length);
+
+      // For scope=Story these are story counts; for scope=Task these are task counts.
+      // For scope=Requirement these will be 0 (placeholders), preserving prior behaviour.
+      setStoryTotalCt((workAll as IssueRow[]).length);
+      setStoryDoneCt((workDone as IssueRow[]).length);
 
       setUpdateStamp(Date.now());
     } catch (e: any) {
@@ -773,9 +806,9 @@ export default function Dashboard() {
   const minSprintEnd = sprintStartISO ? addDays(sprintStartISO, 1) : '';
 
   function onClickCreateBurnup() {
-    if (scope !== 'Story') {
+    if (!(scope === 'Story' || scope === 'Task')) {
       setBurnupError(
-        'Burn-up currently uses Story issues. Switch scope to Story and click Update, then try again.'
+        'Burn-up currently uses Story or Task issues. Switch scope to Story/Task and click Update, then try again.'
       );
       setBurnupModel(null);
       return;
@@ -793,10 +826,10 @@ export default function Dashboard() {
       return;
     }
 
-    // If there is scope but no Done stories yet, do not create a burn-up
+    // If there is scope but no Done work items yet, do not create a burn-up
     if (storyTotalCt > 0 && storyDoneCt === 0) {
       setBurnupError(
-        `No burn up to show as no Story Done yet. Current scope is = ${storyTotalCt}.`
+        `No burn up to show as no ${scope} Done yet. Current scope is = ${storyTotalCt}.`
       );
       setBurnupModel(null);
       setBurnupLock(null);
@@ -940,9 +973,9 @@ export default function Dashboard() {
   const burnupAlreadyCreated =
     !!burnupLock && burnupLock.project === project && burnupLock.scope === scope;
 
-  // true only for the “no Story Done yet” scenario
+  // true only for the “no Done yet” scenario
   const noBurnupAvailable =
-    burnupError?.startsWith('No burn up to show as no Story Done yet') ?? false;
+    burnupError?.startsWith('No burn up to show as no ') ?? false;
 
   const burnupDisabledForProject = burnupAlreadyCreated;
 
@@ -1138,6 +1171,7 @@ export default function Dashboard() {
               >
                 <option value="Requirement">Requirement</option>
                 <option value="Story">Story</option>
+                <option value="Task">Task</option>
               </select>
 
               <Label>Dev Completion (target)</Label>
@@ -1205,8 +1239,9 @@ export default function Dashboard() {
               style={{
                 display: 'grid',
                 gridTemplateColumns: 'minmax(260px, 320px) 1fr',
-                gap: 16,
-                alignItems: 'stretch',
+                columnGap: 28, // ✅ more space between left cards and chart
+                rowGap: 16,
+                alignItems: 'start',
               }}
             >
               {/* Left column: Sprint plan + Velocity snapshot cards */}
@@ -1349,7 +1384,7 @@ export default function Dashboard() {
                   </div>
                   {noBurnupAvailable ? (
                     <div style={{ fontSize: 12, color: '#9ca3af' }}>
-                      No burn up to show as no Story Done yet. Current scope is = {storyTotalCt}.
+                      No burn up to show as no {scope} Done yet. Current scope is = {storyTotalCt}.
                     </div>
                   ) : burnupModel && velocityInsights ? (
                     <div style={{ fontSize: 12, color: '#374151', display: 'grid', rowGap: 4 }}>
@@ -1390,37 +1425,36 @@ export default function Dashboard() {
                 </div>
               </div>
 
-             /* Right column: errors + chart */
-<div
-  style={{
-    display: 'flex',
-    flexDirection: 'column',
-    minHeight: 0,
-    minWidth: 0,           // ✅ important for grid children
-    overflow: 'hidden',    // ✅ stop chart bleeding into left column
-  }}
->
-  {burnupError && (
-    <div style={{ color: '#b91c1c', fontSize: 13, marginBottom: 8 }}>
-      {burnupError}
-    </div>
-  )}
+              {/* Right column: errors + chart */}
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  minHeight: 0,
+                  minWidth: 0, // ✅ important for grid children
+                  overflow: 'hidden', // ✅ stop chart bleeding into left column
+                }}
+              >
+                {burnupError && (
+                  <div style={{ color: '#b91c1c', fontSize: 13, marginBottom: 8 }}>
+                    {burnupError}
+                  </div>
+                )}
 
-  {displayBurnupModel && (
-    <div
-      style={{
-        width: '100%',
-        height: 340,
-        minWidth: 0,          // ✅ allow shrink inside grid
-        overflow: 'hidden',   // ✅ contain SVG/canvas
-        position: 'relative', // ✅ keeps internal absolute elements contained (if any)
-      }}
-    >
-      <BurnupChart model={displayBurnupModel} />
-    </div>
-  )}
-</div>
-
+                {displayBurnupModel && (
+                  <div
+                    style={{
+                      width: '100%',
+                      height: 340,
+                      minWidth: 0, // ✅ allow shrink inside grid
+                      overflow: 'hidden', // ✅ contain SVG/canvas
+                      position: 'relative', // ✅ keeps internal absolute elements contained (if any)
+                    }}
+                  >
+                    <BurnupChart model={displayBurnupModel} />
+                  </div>
+                )}
+              </div>
             </div>
           </section>
         </>

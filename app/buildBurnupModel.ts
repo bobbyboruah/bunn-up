@@ -17,7 +17,7 @@ export interface BurnupIssue {
 export type SprintSummary = {
   index: number;
   startMs: number; // UTC midnight (epoch-day)
-  endMs: number; // UTC midnight (epoch-day)
+  endMs: number; // UTC midnight (epoch-day) (exclusive end boundary for bucketing)
   scopeAtEnd: number; // total scope (stories) existing by end of sprint
   scopeAtStart: number; // scope at sprint start
   doneThisSprint: number; // stories done in this sprint
@@ -54,8 +54,8 @@ export type BurnupProjection = {
   // by the target date.
   requiredStoriesPerSprintToHitTarget: number | null;
 
-  // Recent actual burn rate: avg stories done per sprint over the most recent
-  // 1–2 non-zero closed sprints.
+  // Recent actual burn rate: average stories done per sprint over the
+  // last 2 closed sprints (fallback to 1 if only one closed sprint exists).
   recentStoriesPerSprint: number | null;
 };
 
@@ -66,6 +66,10 @@ export type BurnupModel = {
   targetScope: number; // scope at target date
   latestScope: number; // latest scope in horizon
   todayMs: number;
+
+  // Current sprint window (derived from origin + today; UTC date-only)
+  currentSprintStartMs: number;
+  currentSprintEndMs: number; // inclusive end (date-only)
 
   sprints: SprintSummary[];
   projection: BurnupProjection;
@@ -265,6 +269,17 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     targetDateMs
   );
 
+  // Derive current sprint window (UTC date-only) from origin + today
+  let currentSprintStartMs = originMs;
+  let currentSprintEndMs = originMs; // inclusive
+  if (Number.isFinite(originMs) && Number.isFinite(todayMs) && sprintLenMs > 0) {
+    const deltaMs = todayMs - originMs;
+    const idx = Math.max(0, Math.floor(deltaMs / sprintLenMs));
+    currentSprintStartMs = originMs + idx * sprintLenMs;
+    currentSprintEndMs =
+      currentSprintStartMs + (sprintLenDays - 1) * DAY_MS; // inclusive end date
+  }
+
   // Simple health vs target
   let isOnTrack: boolean | null = null;
   let daysDelta: number | null = null;
@@ -284,6 +299,10 @@ export function buildBurnupModel(input: BuildBurnupInput): BurnupModel {
     targetScope,
     latestScope,
     todayMs,
+
+    currentSprintStartMs,
+    currentSprintEndMs,
+
     sprints,
     projection,
     totalDoneStories,
@@ -304,8 +323,15 @@ export function recomputeProjectionWithFTE(
 ): BurnupModel {
   const safeFte = Math.max(0, Number.isFinite(sprintFTE) ? sprintFTE : 0);
 
-  const { sprints, latestScope, sprintLengthDays, targetDateMs, projection } =
-    model;
+  const {
+    sprints,
+    latestScope,
+    sprintLengthDays,
+    targetDateMs,
+    projection,
+    currentSprintStartMs,
+    currentSprintEndMs,
+  } = model;
 
   if (
     !sprints.length ||
@@ -342,6 +368,8 @@ export function recomputeProjectionWithFTE(
       projection: newProjection,
       isOnTrack: null,
       daysDeltaFromTarget: null,
+      currentSprintStartMs,
+      currentSprintEndMs,
     };
   }
 
@@ -399,6 +427,8 @@ export function recomputeProjectionWithFTE(
     projection: newProjection,
     isOnTrack,
     daysDeltaFromTarget,
+    currentSprintStartMs,
+    currentSprintEndMs,
   };
 }
 
@@ -510,13 +540,19 @@ function emptyModel(
   targetDateMs: number,
   todayMs: number
 ): BurnupModel {
+  const safeOrigin = Number.isFinite(originMs) ? originMs : todayMs;
+
   return {
     sprintLengthDays,
-    originMs: Number.isFinite(originMs) ? originMs : todayMs,
+    originMs: safeOrigin,
     targetDateMs: Number.isFinite(targetDateMs) ? targetDateMs : todayMs,
     targetScope: 0,
     latestScope: 0,
     todayMs,
+
+    currentSprintStartMs: safeOrigin,
+    currentSprintEndMs: safeOrigin,
+
     sprints: [],
     projection: {
       hasSignal: false,
@@ -560,12 +596,33 @@ function computeScopeAtDate(sprints: SprintSummary[], dateMs: number): number {
 }
 
 /**
+ * Compute average stories/sprint over last N closed sprints (includes zeros).
+ * Returns null if there are no closed sprints.
+ */
+function avgStoriesLastNClosed(
+  sprints: SprintSummary[],
+  lastClosedIndex: number,
+  n: number
+): number | null {
+  const vals: number[] = [];
+  for (let i = lastClosedIndex; i >= 0 && vals.length < n; i--) {
+    const s = sprints[i]!;
+    if (!s.isClosed) continue;
+    vals.push(s.doneThisSprint);
+  }
+  if (!vals.length) return null;
+  return vals.reduce((sum, v) => sum + v, 0) / vals.length;
+}
+
+/**
  * Projection FIX:
  * - Anchor at last closed sprint (still true).
- * - Velocity: look back across several closed sprints and use the most recent
+ * - Velocity signal: look back across several closed sprints and use the most recent
  *   1–2 NON-ZERO doneThisSprint values to derive avgVelPerFTE.
  *
- * This prevents hasSignal=false just because the last two sprints had 0 done.
+ * Additional behaviour:
+ * - recentStoriesPerSprint is now the average stories/sprint over the LAST 2 closed sprints
+ *   (includes zeros; fallback to 1 if only one closed sprint exists).
  */
 function computeProjection(
   sprints: SprintSummary[],
@@ -646,10 +703,16 @@ function computeProjection(
 
   const fte = Math.max(0.1, Number.isFinite(sprintFTE) ? sprintFTE : 0);
 
-  // Look back across several closed sprints to find non-zero done sprints
+  // ✅ Current average velocity (stories/sprint) over last 2 closed sprints (includes zeros)
+  const recentStoriesPerSprint = avgStoriesLastNClosed(
+    sprints,
+    lastClosedIndex,
+    2
+  );
+
+  // Look back across several closed sprints to find non-zero done sprints (signal)
   const LOOKBACK_CLOSED = 8;
 
-  const nonZeroDoneThis: number[] = [];
   const nonZeroVelPerFTE: number[] = [];
 
   let takenClosed = 0;
@@ -659,16 +722,10 @@ function computeProjection(
 
     const doneThis = sprints[i]!.doneThisSprint;
     if (doneThis > 0) {
-      nonZeroDoneThis.push(doneThis);
       nonZeroVelPerFTE.push(doneThis / fte);
       if (nonZeroVelPerFTE.length >= 2) break; // most recent 2 non-zero
     }
   }
-
-  const recentStoriesPerSprint =
-    nonZeroDoneThis.length > 0
-      ? nonZeroDoneThis.reduce((sum, n) => sum + n, 0) / nonZeroDoneThis.length
-      : null;
 
   if (!nonZeroVelPerFTE.length) {
     return {

@@ -16,7 +16,8 @@ export function BurnupChart({
     targetDateMs,
     sprints,
     projection,
-    hasAnyDone,          // <-- NEW
+    hasAnyDone, // <-- NEW
+    currentSprintEndMs, // <-- NEW (from buildBurnupModel)
   } = model;
 
   /* ---------- no Done stories: show message, no chart ---------- */
@@ -34,8 +35,7 @@ export function BurnupChart({
         }}
       >
         <strong>No burn up to show as no Story Done yet.</strong>{' '}
-        Current scope is ={' '}
-        <span style={{ fontWeight: 600 }}>{latestScope}</span>.
+        Current scope is = <span style={{ fontWeight: 600 }}>{latestScope}</span>.
       </div>
     );
   }
@@ -265,6 +265,15 @@ export function BurnupChart({
   let anchorPoint: { x: number; y: number } | null = null; // for pulsating dot
   let anchorDoneValue: number | null = null; // numeric label for pulsating dot
 
+  // Scope level used specifically for the target marker (targetScope / latestScope)
+  const scopeY = yForVal(totalScope);
+
+  // Vertical "target date" marker on scope line
+  const idealTargetPoint = {
+    x: xForIndex(targetIndex),
+    y: scopeY,
+  };
+
   if (hasProjection && lastClosed) {
     // Cone starting at last closed sprint
     const anchorIndex = proj.fromSprintIndex as number;
@@ -292,7 +301,10 @@ export function BurnupChart({
       y: yForVal(extendedScope),
     };
 
-    idealPath = buildPath([anchorPoint, centralEndPoint]);
+    // ✅ Change #2: ideal dashed line connects anchor -> TARGET DATE point
+    idealPath = buildPath([anchorPoint, idealTargetPoint]);
+
+    // Keep band lines + fill as-is (only dashed line changes)
     fastPath = buildPath([anchorPoint, fastEndPoint]);
     slowPath = buildPath([anchorPoint, slowEndPoint]);
 
@@ -335,15 +347,6 @@ export function BurnupChart({
       ' Z';
   }
 
-  // Scope level used specifically for the target marker (targetScope / latestScope)
-  const scopeY = yForVal(totalScope);
-
-  // Vertical "target date" marker on scope line
-  const idealTargetPoint = {
-    x: xForIndex(targetIndex),
-    y: scopeY,
-  };
-
   /* ---------- X-axis tick labels (dates per sprint) ---------- */
 
   const xTicks: { x: number; label: string }[] = [];
@@ -380,6 +383,31 @@ export function BurnupChart({
     const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
     const yy = String(d.getUTCFullYear()).slice(2);
     targetLabel = `${dd}/${mm}/${yy}`;
+  }
+
+  /* ---------- Change #1: current avg velocity label under sprint end date ---------- */
+
+  const recentVel =
+    typeof proj?.recentStoriesPerSprint === 'number' &&
+    Number.isFinite(proj.recentStoriesPerSprint)
+      ? (proj.recentStoriesPerSprint as number)
+      : null;
+
+  let currentVelLabelX: number | null = null;
+  if (
+    recentVel != null &&
+    typeof originMs === 'number' &&
+    Number.isFinite(originMs) &&
+    typeof currentSprintEndMs === 'number' &&
+    Number.isFinite(currentSprintEndMs)
+  ) {
+    // Place label at the current sprint end date position (derived from model)
+    const idx = (currentSprintEndMs - originMs) / msPerSprint;
+    const clampedIdx = Math.max(0, Math.min(maxIndex, idx));
+    currentVelLabelX = xForIndex(clampedIdx);
+  } else if (recentVel != null && lastClosed) {
+    // Fallback: align to last closed sprint index
+    currentVelLabelX = xForIndex(lastClosed.index);
   }
 
   /* ---------- legend placement ---------- */
@@ -426,7 +454,7 @@ export function BurnupChart({
               x2={width - padRight}
               y2={y}
               stroke={isZero ? '#9ca3af' : '#f3f4f6'}
-              strokeWidth={isZero ? 1 : 1}
+              strokeWidth={1}
             />
             <text
               x={padLeft - 8}
@@ -453,7 +481,7 @@ export function BurnupChart({
       <path d={fastPath} fill="none" stroke="#3b82f6" strokeWidth={1.5} />
       <path d={slowPath} fill="none" stroke="#3b82f6" strokeWidth={1.5} />
 
-      {/* Ideal (projected) dashed line */}
+      {/* Ideal (required-to-target) dashed line */}
       <path
         d={idealPath}
         fill="none"
@@ -615,6 +643,19 @@ export function BurnupChart({
           fill="#16a34a"
         >
           {targetLabel}
+        </text>
+      )}
+
+      {/* ✅ Current avg velocity label below the sprint end date */}
+      {recentVel != null && currentVelLabelX != null && (
+        <text
+          x={currentVelLabelX}
+          y={height - padBottom + 34}
+          fontSize={10}
+          textAnchor="middle"
+          fill="#6b7280"
+        >
+          Avg vel (last 2): {recentVel.toFixed(1)}
         </text>
       )}
 
